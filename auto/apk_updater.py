@@ -94,7 +94,8 @@ class Config:
         self.mode = env("MODE", "release").lower()
         self.repo = env("GITHUB_REPO").strip("/")
         self.api_base = env("GH_API_BASE", "https://api.github.com").rstrip("/")
-        self.asset_pattern = env("ASSET_PATTERN", "*.apk")
+        patterns = env("ASSET_PATTERN", "*.apk")
+        self.asset_patterns = [item.strip() for item in patterns.split(",") if item.strip()] or ["*.apk"]
         self.release_tag = env("RELEASE_TAG")
         self.include_prerelease = env_bool("INCLUDE_PRERELEASE", False)
         self.raw_url = env("RAW_URL")
@@ -104,7 +105,10 @@ class Config:
         self.version_url = env("VERSION_URL")
         self.download_dir = env("DOWNLOAD_DIR", "/download")
         self.file_stem = env("FILE_STEM")
-        self.stable_name = env_opt("STABLE_NAME")
+        stable = env_opt("STABLE_NAME")
+        if stable is not None and stable.lower() in ("", "auto"):
+            stable = None
+        self.stable_name = stable
         self.keep_versions = env_int("KEEP_VERSIONS", 3)
         self.interval = max(env_int("CHECK_INTERVAL_SECONDS", 3600), 30)
         self.run_on_start = env_bool("RUN_ON_START", True)
@@ -122,9 +126,9 @@ class Config:
         if self.mode == "raw":
             return self.raw_url or "%s/%s/%s/%s" % (
                 self.raw_base, self.repo or "?", self.branch, (self.raw_path or "?").lstrip("/"))
-        return "%s (%s, pattern=%s, tag=%s)" % (
+        return "%s (%s, patterns=%s, tag=%s)" % (
             self.repo or "?", "prerelease" if self.include_prerelease else "latest",
-            self.asset_pattern, self.release_tag or "-")
+            ",".join(self.asset_patterns), self.release_tag or "-")
 
     def default_stem(self):
         if self.file_stem:
@@ -135,10 +139,20 @@ class Config:
             return stem or "download"
         return sanitize_name(self.repo.split("/")[-1]) or "release"
 
-    def stable_target(self, ext):
+    def stem_for(self, asset_name, matched_total):
+        if self.file_stem and matched_total == 1:
+            return self.file_stem
+        stem = sanitize_name(os.path.splitext(asset_name)[0])
+        return stem or "download"
+
+    def stable_for(self, asset_name, matched_total):
         if self.stable_name is None:
-            return self.default_stem() + ext
-        return self.stable_name
+            return asset_name
+        if self.stable_name == "":
+            return ""
+        if matched_total == 1:
+            return self.stable_name
+        return asset_name
 
 
 def url_candidates(url, prefixes):
@@ -196,41 +210,65 @@ def fetch_release(cfg):
     return api_get_json(cfg, "/repos/%s/releases/latest" % cfg.repo)
 
 
-def pick_asset(release, pattern):
+def version_label(release):
+    for value in (release.get("tag_name"), release.get("name")):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def pick_assets(release, patterns):
     assets = [item for item in release.get("assets") or [] if item.get("name")]
-    for asset in assets:
-        if asset["name"].lower() == pattern.lower():
-            return asset
-    for asset in assets:
-        if fnmatch.fnmatch(asset["name"].lower(), pattern.lower()):
-            return asset
-    return None
+    matched = []
+    seen = set()
+    for pattern in patterns:
+        wildcard = pattern.lower()
+        for asset in assets:
+            if asset["id"] in seen:
+                continue
+            if fnmatch.fnmatch(asset["name"].lower(), wildcard):
+                matched.append(asset)
+                seen.add(asset["id"])
+    return matched
 
 
 def plan_release(cfg, state):
     release = fetch_release(cfg)
-    tag = release.get("tag_name") or release.get("name") or "unknown"
-    asset = pick_asset(release, cfg.asset_pattern)
-    if asset is None:
+    tag = version_label(release) or "unknown"
+    matched = pick_assets(release, cfg.asset_patterns)
+    if not matched:
         names = ", ".join(item.get("name", "?") for item in release.get("assets") or []) or "(none)"
         return {"action": "none", "reason": "no asset matches %s in %s; assets: %s"
-                % (cfg.asset_pattern, tag, names)}
-    if state.get("asset_id") == asset.get("id") \
-            and state.get("asset_updated_at") == asset.get("updated_at") \
-            and state.get("tag") == tag:
-        return {"action": "none", "reason": "current: %s %s (%s bytes)"
-                % (tag, asset["name"], asset.get("size"))}
-    urls = url_candidates(asset.get("browser_download_url") or asset.get("url") or "",
-                          cfg.proxy_prefixes)
-    fallback = None
-    if cfg.token and asset.get("id"):
-        fallback = "%s/repos/%s/releases/assets/%s" % (cfg.api_base, cfg.repo, asset["id"])
-    return {"action": "download", "version": tag, "asset_name": asset["name"],
-            "urls": [url for url in urls if url], "expected_size": asset.get("size"),
-            "expected_digest": asset.get("digest"), "fallback_url": fallback,
-            "description": "%s %s (tag %s, %s bytes)" % (cfg.repo, asset["name"], tag, asset.get("size")),
-            "meta": {"asset_id": asset.get("id"), "asset_updated_at": asset.get("updated_at"),
-                     "tag": tag, "release_url": release.get("html_url")}}
+                % (",".join(cfg.asset_patterns), tag, names)}
+    assets_state = state.get("assets") or {}
+    items = []
+    current = []
+    for asset in matched:
+        previous = assets_state.get(asset["name"]) or {}
+        if previous.get("asset_id") == asset.get("id") \
+                and previous.get("asset_updated_at") == asset.get("updated_at") \
+                and previous.get("tag") == tag:
+            current.append(asset["name"])
+            continue
+        urls = url_candidates(asset.get("browser_download_url") or asset.get("url") or "",
+                              cfg.proxy_prefixes)
+        fallback = None
+        if cfg.token and asset.get("id"):
+            fallback = "%s/repos/%s/releases/assets/%s" % (cfg.api_base, cfg.repo, asset["id"])
+        items.append({"asset_name": asset["name"], "version": version_label(release),
+                      "urls": [url for url in urls if url],
+                      "expected_size": asset.get("size"), "expected_digest": asset.get("digest"),
+                      "fallback_url": fallback,
+                      "meta": {"asset_id": asset.get("id"),
+                               "asset_updated_at": asset.get("updated_at"),
+                               "tag": tag, "url": asset.get("browser_download_url")}})
+    if not items:
+        return {"action": "none", "reason": "current: %s %s (%s)"
+                % (cfg.repo, tag, ", ".join(current))}
+    return {"action": "download", "items": items, "matched_total": len(matched),
+            "description": "%s tag %s -> %s" % (cfg.repo, tag,
+                                                ", ".join(item["asset_name"] for item in items)),
+            "tag": tag, "release_url": release.get("html_url")}
 
 
 def raw_target_url(cfg):
@@ -287,6 +325,8 @@ def label_from_last_modified(value):
 
 def plan_raw(cfg, state):
     url = raw_target_url(cfg)
+    name = os.path.basename(urllib.parse.urlsplit(url).path) or "download.bin"
+    previous = (state.get("assets") or {}).get(name) or {}
     meta, candidates = probe_url(cfg, url)
     etag = meta.get("etag")
     last_modified = meta.get("last_modified")
@@ -297,20 +337,19 @@ def plan_raw(cfg, state):
         except ValueError:
             length = None
     same = False
-    if etag and state.get("etag") == etag:
+    if etag and previous.get("etag") == etag:
         same = True
-    elif last_modified and state.get("last_modified") == last_modified \
-            and (length is None or state.get("size") == length):
+    elif last_modified and previous.get("last_modified") == last_modified \
+            and (length is None or previous.get("size") == length):
         same = True
-    if same and state.get("sha256"):
+    if same and previous.get("sha256"):
         return {"action": "none", "reason": "current: %s (etag/last-modified unchanged)" % url}
     version = fetch_version_label(cfg) or label_from_last_modified(last_modified)
-    asset_name = os.path.basename(urllib.parse.urlsplit(url).path) or "download.bin"
-    return {"action": "download", "version": version, "asset_name": asset_name,
-            "urls": candidates, "expected_size": length, "expected_digest": None,
-            "fallback_url": None,
-            "description": "%s (%s bytes)" % (url, length),
-            "meta": {"etag": etag, "last_modified": last_modified, "url": url}}
+    return {"action": "download", "matched_total": 1,
+            "items": [{"asset_name": name, "version": version, "urls": candidates,
+                       "expected_size": length, "expected_digest": None, "fallback_url": None,
+                       "meta": {"etag": etag, "last_modified": last_modified, "url": url}}],
+            "description": "%s (%s bytes)" % (url, length)}
 
 
 def download_once(cfg, url, dest, expected_size=None, expected_digest=None, extra_headers=None):
@@ -354,71 +393,89 @@ def prune_old(cfg, stem, ext):
     return removed
 
 
-def apply_download(cfg, state, plan):
-    asset_name = plan.get("asset_name") or ""
-    ext = os.path.splitext(asset_name)[1] or ".apk"
-    stem = cfg.default_stem()
-    part = os.path.join(cfg.download_dir, ".%s.download.part" % stem)
+def fetch_item(cfg, item, part):
     last_error = None
-    sha = None
-    size = 0
-    for url in plan.get("urls") or []:
+    for url in item.get("urls") or []:
         try:
             log("downloading %s" % url)
-            sha, size = download_once(cfg, url, part, plan.get("expected_size"),
-                                      plan.get("expected_digest"))
-            break
+            return download_once(cfg, url, part, item.get("expected_size"),
+                                 item.get("expected_digest")) + (None,)
         except Exception as error:
             last_error = "%s: %s" % (type(error).__name__, error)
             log("download failed (%s), trying next source" % last_error)
-            sha = None
-    if sha is None and plan.get("fallback_url"):
+    if item.get("fallback_url"):
         try:
             log("downloading via github api (private/authenticated)")
-            sha, size = download_once(cfg, plan["fallback_url"], part,
-                                      plan.get("expected_size"), plan.get("expected_digest"),
-                                      extra_headers={"Accept": "application/octet-stream",
-                                                     "Authorization": "Bearer " + cfg.token})
+            return download_once(cfg, item["fallback_url"], part, item.get("expected_size"),
+                                 item.get("expected_digest"),
+                                 extra_headers={"Accept": "application/octet-stream",
+                                                "Authorization": "Bearer " + cfg.token}) + (None,)
         except Exception as error:
             last_error = "%s: %s" % (type(error).__name__, error)
-            sha = None
-    if sha is None:
-        if os.path.exists(part):
+    return None, 0, last_error
+
+
+def apply_download(cfg, state, plan):
+    assets_state = state.setdefault("assets", {})
+    matched_total = plan.get("matched_total") or len(plan["items"])
+    stable_warned = False
+    errors = []
+    for item in plan["items"]:
+        name = item["asset_name"]
+        previous = assets_state.get(name) or {}
+        ext = os.path.splitext(name)[1] or ".apk"
+        stem = cfg.stem_for(name, matched_total)
+        part = os.path.join(cfg.download_dir, ".%s.download.part" % stem)
+        sha, size, last_error = fetch_item(cfg, item, part)
+        if sha is None:
+            if os.path.exists(part):
+                os.remove(part)
+            errors.append("%s: %s" % (name, last_error))
+            continue
+
+        if previous.get("sha256") == sha:
             os.remove(part)
-        raise RuntimeError("all sources failed: %s" % last_error)
+            log("%s: content identical (sha256 %s), nothing to do" % (name, sha[:12]))
+            merged = {key: previous[key] for key in
+                      ("version", "file", "sha256", "size", "downloaded_at_iso")
+                      if key in previous}
+            merged.update(item["meta"])
+            assets_state[name] = merged
+            continue
 
-    if state.get("sha256") == sha:
-        os.remove(part)
-        log("content identical (sha256 %s), nothing to do" % sha[:12])
-        state.update(plan.get("meta") or {})
-        return
-
-    version = sanitize_name(plan.get("version")) or ("sha-" + sha[:8])
-    target_name = "%s-%s%s" % (stem, version, ext)
-    target = os.path.join(cfg.download_dir, target_name)
-    if os.path.exists(target):
-        version = "%s-%s" % (version, time.strftime("%Y%m%d%H%M%S"))
+        version = sanitize_name(item.get("version")) or ("sha-" + sha[:8])
         target_name = "%s-%s%s" % (stem, version, ext)
         target = os.path.join(cfg.download_dir, target_name)
-    os.replace(part, target)
-    log("saved %s (%d bytes, sha256 %s)" % (target_name, size, sha[:12]))
+        if os.path.exists(target):
+            version = "%s-%s" % (version, time.strftime("%Y%m%d%H%M%S"))
+            target_name = "%s-%s%s" % (stem, version, ext)
+            target = os.path.join(cfg.download_dir, target_name)
+        os.replace(part, target)
+        log("saved %s (%d bytes, sha256 %s)" % (target_name, size, sha[:12]))
 
-    stable = cfg.stable_target(ext)
-    if stable:
-        stable_path = os.path.join(cfg.download_dir, stable)
-        temp = stable_path + ".tmp"
-        shutil.copyfile(target, temp)
-        os.replace(temp, stable_path)
-        log("updated %s" % stable)
+        stable = cfg.stable_for(name, matched_total)
+        if stable:
+            if cfg.stable_name and stable != cfg.stable_name and not stable_warned:
+                log("STABLE_NAME ignored: %d assets matched, keeping original filenames"
+                    % matched_total)
+                stable_warned = True
+            stable_path = os.path.join(cfg.download_dir, stable)
+            temp = stable_path + ".tmp"
+            shutil.copyfile(target, temp)
+            os.replace(temp, stable_path)
+            log("updated %s" % stable)
 
-    removed = prune_old(cfg, stem, ext)
-    if removed:
-        log("removed old versions: %s" % ", ".join(removed))
+        removed = prune_old(cfg, stem, ext)
+        if removed:
+            log("removed old versions: %s" % ", ".join(removed))
 
-    state.update(plan.get("meta") or {})
-    state.update({"last_version": version, "file": target_name, "sha256": sha,
-                  "size": size, "downloaded_at_iso": now_iso(),
-                  "source": plan.get("description")})
+        result = dict(item["meta"])
+        result.update({"version": version, "file": target_name, "sha256": sha,
+                       "size": size, "downloaded_at_iso": now_iso()})
+        assets_state[name] = result
+
+    if errors:
+        raise RuntimeError("failed: " + "; ".join(errors))
 
 
 def check_once(cfg, state):
@@ -431,6 +488,10 @@ def check_once(cfg, state):
         return
     log("update found: %s" % plan.get("description"))
     apply_download(cfg, state, plan)
+    if plan.get("tag"):
+        state["tag"] = plan["tag"]
+    if plan.get("release_url"):
+        state["release_url"] = plan["release_url"]
 
 
 def install_signal_handlers():

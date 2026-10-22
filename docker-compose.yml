@@ -7,16 +7,16 @@ services:
     container_name: apk-updater
     restart: unless-stopped
     volumes:
-      - "${APK_DIR:-/mnt/sata1-2/apk}:/download"
+      - "${APK_DIR:-/mnt/sata1-1/TV}:/download"
       - ./data:/data
     environment:
       TZ: "Asia/Shanghai"
 
       MODE: "${MODE:-release}"
-      GITHUB_REPO: "${GITHUB_REPO:-owner/repo}"
+      GITHUB_REPO: "${GITHUB_REPO:-FongMi/Release}"
       RELEASE_TAG: "${RELEASE_TAG:-}"
       INCLUDE_PRERELEASE: "${INCLUDE_PRERELEASE:-0}"
-      ASSET_PATTERN: "${ASSET_PATTERN:-*.apk}"
+      ASSET_PATTERN: "${ASSET_PATTERN:-leanback-armeabi_v7a.apk,mobile-arm64_v8a.apk}"
 
       RAW_PATH: "${RAW_PATH:-}"
       RAW_URL: "${RAW_URL:-}"
@@ -26,7 +26,7 @@ services:
 
       DOWNLOAD_DIR: "/download"
       FILE_STEM: "${FILE_STEM:-}"
-      STABLE_NAME: "${STABLE_NAME-latest.apk}"
+      STABLE_NAME: "${STABLE_NAME:-auto}"
       KEEP_VERSIONS: "${KEEP_VERSIONS:-3}"
 
       CHECK_INTERVAL_SECONDS: "${CHECK_INTERVAL_SECONDS:-3600}"
