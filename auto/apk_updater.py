@@ -226,13 +226,22 @@ def fetch_release(cfg, tag=None):
     if tag:
         return api_get_json(cfg, "/repos/%s/releases/tags/%s"
                             % (cfg.repo, urllib.parse.quote(tag)))
-    if cfg.include_prerelease:
-        releases = api_get_json(cfg, "/repos/%s/releases?per_page=10" % cfg.repo)
-        releases = [item for item in releases if not item.get("draft")]
-        if not releases:
-            raise RuntimeError("no releases found for %s" % cfg.repo)
-        return releases[0]
-    return api_get_json(cfg, "/repos/%s/releases/latest" % cfg.repo)
+    releases = api_get_json(cfg, "/repos/%s/releases?per_page=20" % cfg.repo)
+    excluded = {target.tag for target in cfg.targets if target.tag}
+    candidates = []
+    for release in releases:
+        if release.get("draft"):
+            continue
+        if release.get("prerelease") and not cfg.include_prerelease:
+            continue
+        if (release.get("tag_name") or "") in excluded:
+            continue
+        candidates.append(release)
+    if not candidates:
+        raise RuntimeError("no usable release found for %s" % cfg.repo)
+    candidates.sort(key=lambda item: (item.get("published_at") or item.get("created_at") or "",
+                                      item.get("id") or 0), reverse=True)
+    return candidates[0]
 
 
 def version_label(release):
