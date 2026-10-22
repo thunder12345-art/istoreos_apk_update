@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APK 自动更新面板</title>
+<style>
+:root{--bg:#111418;--card:#1a1f26;--line:#2a313b;--fg:#e6e9ee;--dim:#8b95a3;
+--accent:#3d8bfd;--ok:#34c77b;--warn:#e0a83c;--err:#e05c5c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:16px}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+h1{font-size:18px;margin:0;flex:1}
+button{border:1px solid var(--line);background:#232a33;color:var(--fg);border-radius:6px;
+padding:7px 14px;cursor:pointer;font-size:13px}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.danger{color:var(--err)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.card .label{color:var(--dim);font-size:12px}
+.card .value{font-size:15px;margin-top:3px;word-break:break-all}
+section{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:14px}
+h2{font-size:14px;margin:0 0 10px;color:var(--dim);font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}
+label{display:block;font-size:12px;color:var(--dim);margin-bottom:4px}
+input[type=text],input[type=password],input[type=number]{width:100%;background:#12161c;
+border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:7px 9px;font-size:13px}
+input:focus{outline:none;border-color:var(--accent)}
+.hint{color:var(--dim);font-size:12px;margin-top:6px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{color:var(--dim);font-weight:600;font-size:12px}
+table input[type=text]{padding:5px 7px}
+pre{background:#0d1015;border:1px solid var(--line);border-radius:6px;padding:10px;
+max-height:320px;overflow:auto;font-size:12px;margin:0;white-space:pre-wrap;word-break:break-all}
+.tag-ok{color:var(--ok)}.tag-dim{color:var(--dim)}
+#toast{position:fixed;right:16px;bottom:16px;background:#232a33;border:1px solid var(--accent);
+border-radius:8px;padding:10px 16px;display:none;max-width:70vw}
+#toast.err{border-color:var(--err)}
+.check{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--fg)}
+.check input{width:auto}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>APK 自动更新面板</h1>
+  <button onclick="refresh()">刷新</button>
+  <button onclick="manualCheck()">立即检查</button>
+  <button class="primary" onclick="saveConfig()">保存配置</button>
+</header>
+
+<div class="cards">
+  <div class="card"><div class="label">仓库 / 当前版本</div><div class="value" id="c-repo">-</div></div>
+  <div class="card"><div class="label">最近检查</div><div class="value" id="c-last">-</div></div>
+  <div class="card"><div class="label">下次检查</div><div class="value" id="c-next">-</div></div>
+  <div class="card"><div class="label">保存位置</div><div class="value" id="c-dir">-</div></div>
+  <div class="card"><div class="label">文件数量</div><div class="value" id="c-count">-</div></div>
+</div>
+
+<section>
+  <h2>基本配置</h2>
+  <div class="grid">
+    <div><label>GitHub 仓库 (owner/repo)</label><input type="text" id="f-repo"></div>
+    <div><label>保存位置（NAS 上的目录）</label><input type="text" id="f-dir">
+      <div class="hint">/nas 等于 NAS 数据盘根目录；改这里即可换目标文件夹（如 /nas/TV2）</div></div>
+    <div><label>检查间隔（小时）</label><input type="number" id="f-interval" min="0.1" step="0.5"></div>
+    <div><label>版本化文件保留个数</label><input type="number" id="f-keep" min="0" step="1"></div>
+    <div><label>固定名副本（auto / 留空 / 自定义名）</label><input type="text" id="f-stable" placeholder="auto"></div>
+    <div><label>GitHub 加速前缀（可逗号分隔多个）</label><input type="text" id="f-proxy"></div>
+    <div><label>GitHub Token（私有库/防限流，可留空）</label><input type="password" id="f-token"></div>
+    <div><label>包含预发布版本</label>
+      <div class="check"><input type="checkbox" id="f-prerelease"><span>下载 prerelease</span></div></div>
+  </div>
+  <div class="hint">修改在点击「保存配置」后立即生效，并自动触发一次检查</div>
+</section>
+
+<section>
+  <h2>下载目标（tag + 匹配规则）</h2>
+  <table>
+    <thead><tr><th style="width:22%">tag（留空=最新）</th><th>文件匹配（逗号分隔）</th>
+    <th style="width:110px">版本化保存</th><th style="width:70px"></th></tr></thead>
+    <tbody id="targets"></tbody>
+  </table>
+  <div style="margin-top:10px"><button onclick="addTarget()">添加目标</button></div>
+  <div class="hint">例：tag 留空 + leanback-armeabi_v7a.apk,mobile-arm64_v8a.apk → 版本化；
+  tag 填 module + *.apk + 不勾选版本化 → 按原始文件名保存</div>
+</section>
+
+<section>
+  <h2>已下载文件</h2>
+  <table>
+    <thead><tr><th>文件名</th><th style="width:110px">大小</th><th style="width:180px">修改时间</th></tr></thead>
+    <tbody id="files"></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>运行日志</h2>
+  <pre id="logs">加载中...</pre>
+</section>
+</div>
+<div id="toast"></div>
+
+<script>
+let countdown = null;
+let formDirty = false;
+const $ = id => document.getElementById(id);
+
+function getToken(){
+  const q = new URLSearchParams(location.search).get("token");
+  if (q){ localStorage.setItem("panel_token", q); }
+  return localStorage.getItem("panel_token") || "";
+}
+
+function toast(msg, isErr){
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = isErr ? "err" : "";
+  el.style.display = "block";
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.style.display = "none", 4000);
+}
+
+async function api(path, options){
+  options = options || {};
+  const headers = options.headers || {};
+  const token = getToken();
+  if (token) headers["X-Panel-Token"] = token;
+  if (options.body) headers["Content-Type"] = "application/json";
+  options.headers = headers;
+  const resp = await fetch(path, options);
+  if (resp.status === 401){ throw new Error("未授权：URL 加 ?token=你的PANEL_TOKEN 后回车"); }
+  return resp.json();
+}
+
+function fmtSize(n){
+  if (n >= 1048576) return (n/1048576).toFixed(1) + " MB";
+  if (n >= 1024) return (n/1024).toFixed(0) + " KB";
+  return n + " B";
+}
+
+function fmtLeft(sec){
+  if (sec == null) return "-";
+  if (sec <= 0) return "即将执行";
+  const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
+  return (h? h+"时" : "") + (m? m+"分" : "") + s + "秒";
+}
+
+function addTargetRow(tag, patterns, archive){
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td><input type="text" class="t-tag" placeholder="留空=最新版本"></td>
+    <td><input type="text" class="t-patterns"></td>
+    <td><div class="check"><input type="checkbox" class="t-archive"><span>保留版本</span></div></td>
+    <td><button class="danger" onclick="this.closest('tr').remove(); formDirty=true;">删除</button></td>`;
+  tr.querySelector(".t-tag").value = tag || "";
+  tr.querySelector(".t-patterns").value = (patterns || []).join(",");
+  tr.querySelector(".t-archive").checked = !!archive;
+  tr.querySelectorAll("input").forEach(el => el.addEventListener("input", () => formDirty = true));
+  $("targets").appendChild(tr);
+}
+
+function addTarget(){ addTargetRow("", "", true); formDirty = true; }
+
+function fillConfig(cfg){
+  if (formDirty) return;
+  $("f-repo").value = cfg.repo || "";
+  $("f-dir").value = cfg.download_dir || "";
+  $("f-interval").value = ((cfg.check_interval_seconds || 86400) / 3600).toFixed(2).replace(/\.?0+$/, "");
+  $("f-keep").value = cfg.keep_versions != null ? cfg.keep_versions : 1;
+  $("f-stable").value = cfg.stable_name != null ? cfg.stable_name : "auto";
+  $("f-proxy").value = cfg.proxy_prefix || "";
+  $("f-token").value = cfg.github_token || "";
+  $("f-prerelease").checked = !!cfg.include_prerelease;
+  $("targets").innerHTML = "";
+  (cfg.targets || []).forEach(t => addTargetRow(t.tag, t.patterns, t.archive));
+}
+
+function collectConfig(){
+  const targets = [];
+  $("targets").querySelectorAll("tr").forEach(tr => {
+    targets.push({
+      tag: tr.querySelector(".t-tag").value.trim(),
+      patterns: tr.querySelector(".t-patterns").value.split(",").map(s => s.trim()).filter(Boolean),
+      archive: tr.querySelector(".t-archive").checked,
+    });
+  });
+  const hours = parseFloat($("f-interval").value) || 24;
+  return {
+    repo: $("f-repo").value.trim(),
+    download_dir: $("f-dir").value.trim(),
+    check_interval_seconds: Math.round(hours * 3600),
+    keep_versions: parseInt($("f-keep").value || "1", 10),
+    stable_name: $("f-stable").value.trim() || "auto",
+    proxy_prefix: $("f-proxy").value.trim(),
+    github_token: $("f-token").value.trim(),
+    include_prerelease: $("f-prerelease").checked,
+    targets: targets,
+  };
+}
+
+async function saveConfig(){
+  try {
+    const data = await api("/api/config", { method: "POST", body: JSON.stringify(collectConfig()) });
+    if (data.error){ toast("保存失败：" + data.error, true); return; }
+    formDirty = false;
+    toast("配置已保存，已触发检查");
+    fillConfig(data.config);
+    setTimeout(refresh, 1500);
+  } catch (e){ toast(String(e.message || e), true); }
+}
+
+async function manualCheck(){
+  try {
+    await api("/api/check", { method: "POST", body: "{}" });
+    toast("已触发检查，稍后刷新查看结果");
+    setTimeout(refresh, 3000);
+  } catch (e){ toast(String(e.message || e), true); }
+}
+
+async function refresh(){
+  try {
+    const st = await api("/status");
+    if (st.error){ toast("获取状态失败：" + st.error, true); return; }
+    const cfg = st.config || {};
+    $("c-repo").textContent = (cfg.repo || "-") + " | " + (st.tag || "-");
+    $("c-last").textContent = st.last_check_iso || "-";
+    $("c-dir").textContent = cfg.download_dir || "-";
+    $("c-count").textContent = (st.files || []).length + " 个";
+    const next = st.next_check_seconds;
+    if (countdown) clearInterval(countdown);
+    let left = next;
+    const render = () => $("c-next").textContent = fmtLeft(left);
+    render();
+    countdown = setInterval(() => { if (left != null){ left = Math.max(0, left - 1); render(); } }, 1000);
+    fillConfig(cfg);
+    const tbody = $("files");
+    tbody.innerHTML = "";
+    (st.files || []).forEach(f => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td></td><td></td><td></td>";
+      tr.children[0].textContent = f.name;
+      tr.children[1].textContent = fmtSize(f.size);
+      tr.children[2].textContent = f.mtime;
+      tbody.appendChild(tr);
+    });
+    $("logs").textContent = (st.logs || []).join("\n");
+  } catch (e){ toast(String(e.message || e), true); }
+}
+
+["f-repo","f-dir","f-interval","f-keep","f-stable","f-proxy","f-token","f-prerelease"]
+  .forEach(id => $(id).addEventListener("input", () => formDirty = true));
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

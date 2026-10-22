@@ -1,3 +1,4 @@
+import copy
 import fnmatch
 import glob
 import hashlib
@@ -8,17 +9,24 @@ import shutil
 import signal
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UA = "apk-updater/1.0"
 CHUNK = 256 * 1024
+BASE = os.path.dirname(os.path.abspath(__file__))
+PANEL_FILE = os.path.join(BASE, "panel.html")
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
+
+LOG_LINES = deque(maxlen=400)
 
 
 def setup_stdout():
@@ -60,7 +68,22 @@ def now_iso():
 
 
 def log(message):
-    print("[%s] %s" % (now_iso(), message), flush=True)
+    line = "[%s] %s" % (now_iso(), message)
+    LOG_LINES.append(line)
+    print(line, flush=True)
+    path = env("LOG_FILE", "/data/updater.log")
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 512 * 1024:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(list(LOG_LINES)[-200:]) + "\n")
+        else:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+    except Exception:
+        pass
 
 
 def load_json(path, default=None):
@@ -89,6 +112,15 @@ def sanitize_name(value):
     return cleaned
 
 
+def parse_prefixes(text):
+    result = []
+    for item in str(text or "").split(","):
+        item = item.strip()
+        if item:
+            result.append(item.rstrip("/") + "/")
+    return result
+
+
 class ReleaseTarget:
     def __init__(self, tag, patterns, archive, label):
         self.tag = tag
@@ -98,7 +130,7 @@ class ReleaseTarget:
 
 
 class Config:
-    def __init__(self):
+    def __init__(self, data=None):
         self.mode = env("MODE", "release").lower()
         self.repo = env("GITHUB_REPO").strip("/")
         self.api_base = env("GH_API_BASE", "https://api.github.com").rstrip("/")
@@ -125,24 +157,79 @@ class Config:
         self.raw_base = env("RAW_BASE", "https://raw.githubusercontent.com").rstrip("/")
         self.branch = env("GITHUB_BRANCH", "main")
         self.version_url = env("VERSION_URL")
-        self.download_dir = env("DOWNLOAD_DIR", "/download")
+        self.download_dir = env("DOWNLOAD_DIR", "/nas/TV")
         self.file_stem = env("FILE_STEM")
         stable = env_opt("STABLE_NAME")
         if stable is not None and stable.lower() in ("", "auto"):
             stable = None
         self.stable_name = stable
-        self.keep_versions = env_int("KEEP_VERSIONS", 3)
-        self.interval = max(env_int("CHECK_INTERVAL_SECONDS", 3600), 30)
+        self.keep_versions = env_int("KEEP_VERSIONS", 1)
+        self.interval = max(env_int("CHECK_INTERVAL_SECONDS", 86400), 30)
         self.run_on_start = env_bool("RUN_ON_START", True)
         self.run_once = env_bool("RUN_ONCE", False)
         self.timeout = env_int("REQUEST_TIMEOUT", 30)
         self.token = env("GITHUB_TOKEN")
         self.state_path = env("STATE_FILE", "/data/state.json")
-        self.proxy_prefixes = []
-        for item in env("PROXY_PREFIX").split(","):
-            item = item.strip()
-            if item:
-                self.proxy_prefixes.append(item.rstrip("/") + "/")
+        self.proxy_prefixes = parse_prefixes(env("PROXY_PREFIX"))
+        if data:
+            self.apply_overrides(data)
+
+    def apply_overrides(self, data):
+        if not isinstance(data, dict):
+            return
+        if data.get("repo"):
+            self.repo = str(data["repo"]).strip().strip("/")
+        if data.get("download_dir"):
+            self.download_dir = str(data["download_dir"]).strip()
+        if data.get("check_interval_seconds") is not None:
+            try:
+                self.interval = max(int(data["check_interval_seconds"]), 30)
+            except (TypeError, ValueError):
+                pass
+        if data.get("keep_versions") is not None:
+            try:
+                self.keep_versions = max(int(data["keep_versions"]), 0)
+            except (TypeError, ValueError):
+                pass
+        if "stable_name" in data:
+            value = data.get("stable_name")
+            value = "auto" if value is None else str(value).strip()
+            self.stable_name = None if value.lower() in ("", "auto") else value
+        if "proxy_prefix" in data:
+            self.proxy_prefixes = parse_prefixes(data.get("proxy_prefix"))
+        if "github_token" in data:
+            self.token = str(data.get("github_token") or "").strip()
+        if "include_prerelease" in data:
+            self.include_prerelease = bool(data.get("include_prerelease"))
+        if isinstance(data.get("targets"), list) and data["targets"]:
+            targets = []
+            for item in data["targets"]:
+                if not isinstance(item, dict):
+                    continue
+                tag = str(item.get("tag") or "").strip() or None
+                pats = item.get("patterns")
+                if isinstance(pats, str):
+                    pats = [part.strip() for part in pats.split(",")]
+                pats = [str(part).strip() for part in (pats or []) if str(part).strip()] or ["*.apk"]
+                targets.append(ReleaseTarget(tag, pats, bool(item.get("archive", True)),
+                                             tag or "latest"))
+            if targets:
+                self.targets = targets
+
+    def to_config_dict(self):
+        return {
+            "repo": self.repo,
+            "download_dir": self.download_dir,
+            "check_interval_seconds": self.interval,
+            "keep_versions": self.keep_versions,
+            "stable_name": "auto" if self.stable_name is None else self.stable_name,
+            "proxy_prefix": ",".join(prefix.rstrip("/") for prefix in self.proxy_prefixes),
+            "github_token": self.token,
+            "include_prerelease": self.include_prerelease,
+            "targets": [{"tag": target.tag or "", "patterns": list(target.patterns),
+                         "archive": target.archive} for target in self.targets],
+            "mode": self.mode,
+        }
 
     def target_desc(self):
         if self.mode == "raw":
@@ -280,7 +367,8 @@ def plan_release(cfg, state, target):
     matched = pick_assets(release, target.patterns)
     if not matched:
         names = ", ".join(item.get("name", "?") for item in release.get("assets") or []) or "(none)"
-        return {"action": "none", "reason": "[%s] no asset matches %s in %s; assets: %s"
+        return {"action": "none", "tag": tag,
+                "reason": "[%s] no asset matches %s in %s; assets: %s"
                 % (target.label, ",".join(target.patterns), tag, names)}
     assets_state = state.get("assets") or {}
     items = []
@@ -291,8 +379,11 @@ def plan_release(cfg, state, target):
         if previous.get("asset_id") == asset.get("id") \
                 and previous.get("asset_updated_at") == asset.get("updated_at") \
                 and previous.get("tag") == tag:
-            current.append(asset["name"])
-            continue
+            probe = {"asset_name": asset["name"], "archive": target.archive,
+                     "matched_total": len(matched)}
+            if files_present(cfg, probe, previous):
+                current.append(asset["name"])
+                continue
         urls = url_candidates(asset.get("browser_download_url") or asset.get("url") or "",
                               cfg.proxy_prefixes)
         fallback = None
@@ -308,7 +399,8 @@ def plan_release(cfg, state, target):
                                "asset_updated_at": asset.get("updated_at"),
                                "tag": tag, "url": asset.get("browser_download_url")}})
     if not items:
-        return {"action": "none", "reason": "[%s] current: %s %s (%s)"
+        return {"action": "none", "tag": tag,
+                "reason": "[%s] current: %s %s (%s)"
                 % (target.label, cfg.repo, tag, ", ".join(current))}
     return {"action": "download", "items": items,
             "description": "[%s] %s tag %s -> %s" % (target.label, cfg.repo, tag,
@@ -389,7 +481,9 @@ def plan_raw(cfg, state):
     elif last_modified and previous.get("last_modified") == last_modified \
             and (length is None or previous.get("size") == length):
         same = True
-    if same and previous.get("sha256"):
+    if same and previous.get("sha256") \
+            and files_present(cfg, {"asset_name": name, "archive": True, "matched_total": 1},
+                              previous):
         return {"action": "none", "reason": "[raw] current: %s (etag/last-modified unchanged)" % url}
     version = fetch_version_label(cfg) or label_from_last_modified(last_modified)
     return {"action": "download", "matched_total": 1,
@@ -465,6 +559,19 @@ def fetch_item(cfg, item, part):
     return None, 0, last_error
 
 
+def files_present(cfg, item, previous):
+    name = item["asset_name"]
+    if not item.get("archive", True):
+        return os.path.exists(os.path.join(cfg.download_dir, name))
+    file_name = previous.get("file")
+    if not file_name or not os.path.exists(os.path.join(cfg.download_dir, file_name)):
+        return False
+    stable = cfg.stable_for(name, item.get("matched_total") or 1)
+    if stable and not os.path.exists(os.path.join(cfg.download_dir, stable)):
+        return False
+    return True
+
+
 def apply_download(cfg, state, plan):
     assets_state = state.setdefault("assets", {})
     stable_warned = False
@@ -485,7 +592,7 @@ def apply_download(cfg, state, plan):
             errors.append("%s: %s" % (name, last_error))
             continue
 
-        if previous.get("sha256") == sha:
+        if previous.get("sha256") == sha and files_present(cfg, item, previous):
             os.remove(part)
             log("%s: content identical (sha256 %s), nothing to do" % (name, sha[:12]))
             merged = {field: previous[field] for field in
@@ -551,19 +658,302 @@ def check_once(cfg, state):
     for label, planner in jobs:
         try:
             plan = planner()
+            if plan.get("tag"):
+                state.setdefault("tags", {})[label] = plan["tag"]
             if plan["action"] == "none":
                 log("no update: %s" % plan.get("reason"))
                 continue
             log("update found: %s" % plan.get("description"))
             apply_download(cfg, state, plan)
-            if plan.get("tag"):
-                state["tag"] = plan["tag"]
             if plan.get("release_url"):
                 state["release_url"] = plan["release_url"]
         except Exception as error:
             errors.append("%s: %s: %s" % (label, type(error).__name__, error))
     if errors:
         raise RuntimeError("; ".join(errors))
+
+
+def validate(cfg):
+    if cfg.mode not in ("release", "raw"):
+        return "invalid MODE=%s (use release or raw)" % cfg.mode
+    if cfg.mode == "release" and not cfg.repo:
+        return "release mode needs GITHUB_REPO=owner/repo"
+    if cfg.mode == "raw" and not (cfg.raw_url or (cfg.repo and cfg.raw_path)):
+        return "raw mode needs RAW_URL or GITHUB_REPO + RAW_PATH"
+    return ""
+
+
+def validate_config_update(cfg, data):
+    download_dir = str(data.get("download_dir") or cfg.download_dir).strip()
+    if not download_dir.startswith("/"):
+        return "保存位置必须是绝对路径"
+    if not (download_dir == "/nas" or download_dir.startswith("/nas/")
+            or download_dir == "/download" or download_dir.startswith("/download/")):
+        return "保存位置需位于 /nas 下（/nas = compose 中 NAS_ROOT 挂载的 NAS 磁盘）"
+    repo = str(data.get("repo") or cfg.repo or "").strip()
+    if not repo or "/" not in repo:
+        return "仓库格式应为 owner/repo"
+    targets = data.get("targets")
+    if not isinstance(targets, list) or not targets:
+        return "至少需要一个下载目标"
+    for item in targets:
+        if not isinstance(item, dict):
+            return "下载目标格式错误"
+        patterns = item.get("patterns")
+        if isinstance(patterns, str):
+            patterns = [part for part in patterns.split(",") if part.strip()]
+        if not [part for part in (patterns or []) if str(part).strip()]:
+            return "每个下载目标的匹配规则不能为空"
+    try:
+        interval = int(data.get("check_interval_seconds") or cfg.interval)
+    except (TypeError, ValueError):
+        return "检查间隔必须是数字"
+    if interval < 30:
+        return "检查间隔至少 30 秒"
+    return ""
+
+
+def clean_config_payload(cfg, data):
+    cleaned = {
+        "repo": str(data.get("repo") or cfg.repo).strip().strip("/"),
+        "download_dir": str(data.get("download_dir") or cfg.download_dir).strip().rstrip("/") or "/",
+        "check_interval_seconds": int(data.get("check_interval_seconds") or cfg.interval),
+        "keep_versions": int(data.get("keep_versions") if data.get("keep_versions") is not None
+                             else cfg.keep_versions),
+        "stable_name": str(data.get("stable_name") if data.get("stable_name") is not None else "auto"),
+        "proxy_prefix": str(data.get("proxy_prefix") or "").strip(),
+        "github_token": str(data.get("github_token") or "").strip(),
+        "include_prerelease": bool(data.get("include_prerelease")),
+        "targets": [],
+        "mode": cfg.mode,
+    }
+    for item in data.get("targets") or []:
+        patterns = item.get("patterns")
+        if isinstance(patterns, str):
+            patterns = [part.strip() for part in patterns.split(",")]
+        patterns = [str(part).strip() for part in (patterns or []) if str(part).strip()]
+        cleaned["targets"].append({
+            "tag": str(item.get("tag") or "").strip(),
+            "patterns": patterns or ["*.apk"],
+            "archive": bool(item.get("archive", True)),
+        })
+    return cleaned
+
+
+class Updater:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.trigger = threading.Event()
+        self.stop = threading.Event()
+        self.config_path = env("CONFIG_FILE", "/data/config.json")
+        self.state_path = env("STATE_FILE", "/data/state.json")
+        data = self.load_config()
+        self.cfg = Config(data)
+        self.state = load_json(self.state_path) or {}
+
+    def load_config(self):
+        data = load_json(self.config_path)
+        if data is None:
+            data = Config().to_config_dict()
+            save_json(self.config_path, data)
+            log("created %s from environment defaults" % self.config_path)
+        return data
+
+    def save_config(self, payload):
+        with self.lock:
+            problem = validate_config_update(self.cfg, payload)
+            if problem:
+                raise ValueError(problem)
+            cleaned = clean_config_payload(self.cfg, payload)
+            save_json(self.config_path, cleaned)
+            self.cfg = Config(cleaned)
+        log("config updated via panel (dir=%s, targets=%d, interval=%ss)"
+            % (self.cfg.download_dir, len(self.cfg.targets), self.cfg.interval))
+        try:
+            os.makedirs(self.cfg.download_dir, exist_ok=True)
+        except OSError as error:
+            log("warning: cannot create %s: %s" % (self.cfg.download_dir, error))
+        self.trigger.set()
+        return self.cfg
+
+    def snapshot(self):
+        with self.lock:
+            return copy.deepcopy(self.cfg), copy.deepcopy(self.state)
+
+    def run_forever(self):
+        first = True
+        while not self.stop.is_set():
+            cfg, _ = self.snapshot()
+            if first and not cfg.run_on_start and not cfg.run_once:
+                log("RUN_ON_START=0, waiting %ss before first check" % cfg.interval)
+            else:
+                local_state = self.snapshot()[1]
+                try:
+                    check_once(cfg, local_state)
+                except Exception as error:
+                    log("check failed: %s: %s" % (type(error).__name__, error))
+                with self.lock:
+                    local_state["last_check_ts"] = time.time()
+                    local_state["last_check_iso"] = now_iso()
+                    self.state = local_state
+                    save_json(self.state_path, self.state)
+                if cfg.run_once:
+                    log("RUN_ONCE=1, exiting")
+                    self.stop.set()
+                    return
+            first = False
+            self.wait_next(cfg.interval)
+
+    def wait_next(self, interval):
+        deadline = time.time() + interval
+        while not self.stop.is_set():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            if self.trigger.wait(timeout=min(remaining, 5)):
+                self.trigger.clear()
+                return
+
+    def status(self):
+        cfg, state = self.snapshot()
+        files = []
+        try:
+            entries = sorted(os.scandir(cfg.download_dir), key=lambda entry: entry.name.lower())
+            for entry in entries:
+                if not entry.is_file() or entry.name.startswith("."):
+                    continue
+                info = entry.stat()
+                files.append({"name": entry.name, "size": info.st_size,
+                              "mtime": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                     time.localtime(info.st_mtime))})
+        except OSError:
+            pass
+        last = float(state.get("last_check_ts") or 0)
+        tags = state.get("tags") or {}
+        main_tag = None
+        if cfg.mode == "release" and cfg.targets:
+            main_tag = tags.get("release:%s" % cfg.targets[0].label)
+        if not main_tag:
+            main_tag = tags.get(cfg.targets[0].label) if cfg.targets else None
+        if not main_tag:
+            main_tag = state.get("tag")
+        result = {
+            "ok": True,
+            "mode": cfg.mode,
+            "config": cfg.to_config_dict(),
+            "target_desc": cfg.target_desc(),
+            "last_check_iso": state.get("last_check_iso"),
+            "next_check_seconds": max(0, int(last + cfg.interval - time.time())) if last else None,
+            "tag": main_tag,
+            "tags": tags,
+            "assets": state.get("assets") or {},
+            "files": files,
+            "logs": list(LOG_LINES)[-300:],
+            "panel_token_required": bool(PANEL_TOKEN),
+        }
+        return result
+
+    def health(self):
+        cfg, state = self.snapshot()
+        last = float(state.get("last_check_ts") or 0)
+        if last:
+            healthy = (time.time() - last) <= max(2 * cfg.interval, 1800)
+        else:
+            healthy = True
+        return healthy, {"ok": True, "healthy": healthy, "last_check_ts": last}
+
+
+PANEL_TOKEN = env("PANEL_TOKEN")
+
+
+class PanelHandler(BaseHTTPRequestHandler):
+    server_version = "apk-updater-panel/1.0"
+    updater = None
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def send_json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def authorized(self):
+        if not PANEL_TOKEN:
+            return True
+        parsed = urllib.parse.urlsplit(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if query.get("token", [""])[0] == PANEL_TOKEN:
+            return True
+        return self.headers.get("X-Panel-Token", "") == PANEL_TOKEN
+
+    def read_body(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 1024 * 1024:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except Exception:
+            return None
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path in ("/", "/panel"):
+            try:
+                with open(PANEL_FILE, "rb") as handle:
+                    body = handle.read()
+            except OSError:
+                self.send_json({"error": "panel.html missing"}, 500)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/healthz":
+            healthy, payload = self.updater.health()
+            self.send_json(payload, 200 if healthy else 503)
+            return
+        if path == "/status":
+            if not self.authorized():
+                self.send_json({"error": "unauthorized"}, 401)
+                return
+            self.send_json(self.updater.status())
+            return
+        self.send_json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        if not self.authorized():
+            self.send_json({"error": "unauthorized"}, 401)
+            return
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/config":
+            payload = self.read_body()
+            if payload is None:
+                self.send_json({"error": "invalid json"}, 400)
+                return
+            try:
+                cfg = self.updater.save_config(payload)
+            except ValueError as error:
+                self.send_json({"error": str(error)}, 400)
+                return
+            self.send_json({"ok": True, "config": cfg.to_config_dict()})
+            return
+        if path == "/api/check":
+            self.updater.trigger.set()
+            log("manual check requested via panel")
+            self.send_json({"ok": True, "message": "已触发检查"})
+            return
+        self.send_json({"error": "not found"}, 404)
 
 
 def install_signal_handlers():
@@ -579,50 +969,34 @@ def install_signal_handlers():
             pass
 
 
-def validate(cfg):
-    if cfg.mode not in ("release", "raw"):
-        return "invalid MODE=%s (use release or raw)" % cfg.mode
-    if cfg.mode == "release" and not cfg.repo:
-        return "release mode needs GITHUB_REPO=owner/repo"
-    if cfg.mode == "raw" and not (cfg.raw_url or (cfg.repo and cfg.raw_path)):
-        return "raw mode needs RAW_URL or GITHUB_REPO + RAW_PATH"
-    return ""
-
-
 def main():
     setup_stdout()
-    cfg = Config()
-    problem = validate(cfg)
+    updater = Updater()
+    problem = validate(updater.cfg)
     if problem:
         log("config error: %s" % problem)
         return 2
-    os.makedirs(cfg.download_dir, exist_ok=True)
-    state = load_json(cfg.state_path) or {}
+    try:
+        os.makedirs(updater.cfg.download_dir, exist_ok=True)
+    except OSError as error:
+        log("warning: cannot create %s: %s" % (updater.cfg.download_dir, error))
+    port = env_int("PORT", 8080)
+    handler = PanelHandler
+    handler.updater = updater
+    server = ThreadingHTTPServer(("0.0.0.0", port), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     log("apk-updater start | mode=%s dir=%s interval=%ss keep=%d" % (
-        cfg.mode, cfg.download_dir, cfg.interval, cfg.keep_versions))
-    log("target: %s" % cfg.target_desc())
-    if cfg.token:
+        updater.cfg.mode, updater.cfg.download_dir, updater.cfg.interval,
+        updater.cfg.keep_versions))
+    log("target: %s" % updater.cfg.target_desc())
+    log("panel: http://<nas-ip>:%d/ | token %s"
+        % (port, "enabled" if PANEL_TOKEN else "disabled"))
+    if updater.cfg.token:
         log("github token: configured")
-    if cfg.proxy_prefixes:
-        log("proxy prefixes: %s" % ", ".join(cfg.proxy_prefixes))
+    if updater.cfg.proxy_prefixes:
+        log("proxy prefixes: %s" % ", ".join(updater.cfg.proxy_prefixes))
     install_signal_handlers()
-    first = True
-    while True:
-        if first and not cfg.run_on_start and not cfg.run_once:
-            log("RUN_ON_START=0, waiting %ss before first check" % cfg.interval)
-        else:
-            try:
-                check_once(cfg, state)
-            except Exception as error:
-                log("check failed: %s: %s" % (type(error).__name__, error))
-            state["last_check_ts"] = time.time()
-            state["last_check_iso"] = now_iso()
-            save_json(cfg.state_path, state)
-            if cfg.run_once:
-                log("RUN_ONCE=1, exiting")
-                return 0
-        first = False
-        time.sleep(cfg.interval)
+    updater.run_forever()
     return 0
 
 

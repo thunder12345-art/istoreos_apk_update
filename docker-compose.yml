@@ -6,11 +6,15 @@ services:
     image: apk-updater:latest
     container_name: apk-updater
     restart: unless-stopped
+    ports:
+      - "${PANEL_PORT:-8898}:8080"
     volumes:
-      - "${APK_DIR:-/mnt/sata1-1/TV}:/download"
+      - "${NAS_ROOT:-/mnt/data_sda1}:/nas"
       - ./data:/data
     environment:
       TZ: "Asia/Shanghai"
+      PORT: "8080"
+      PANEL_TOKEN: "${PANEL_TOKEN:-}"
 
       MODE: "${MODE:-release}"
       GITHUB_REPO: "${GITHUB_REPO:-FongMi/Release}"
@@ -25,7 +29,7 @@ services:
       GITHUB_BRANCH: "${GITHUB_BRANCH:-main}"
       VERSION_URL: "${VERSION_URL:-}"
 
-      DOWNLOAD_DIR: "/download"
+      DOWNLOAD_DIR: "${DOWNLOAD_DIR:-/nas/TV}"
       FILE_STEM: "${FILE_STEM:-}"
       STABLE_NAME: "${STABLE_NAME:-auto}"
       KEEP_VERSIONS: "${KEEP_VERSIONS:-1}"

@@ -11,7 +11,8 @@ RUN apt-get update \
 WORKDIR /app
 COPY auto/ /app/auto/
 
-HEALTHCHECK --interval=5m --timeout=15s --start-period=90s --retries=3 \
-    CMD python -c "import json,os,time; s=json.load(open(os.environ.get('STATE_FILE','/data/state.json'))); i=float(os.environ.get('CHECK_INTERVAL_SECONDS','86400')); raise SystemExit(0 if time.time()-float(s.get('last_check_ts') or 0) <= max(2*i,1800) else 1)"
+EXPOSE 8080
+HEALTHCHECK --interval=60s --timeout=15s --start-period=90s --retries=3 \
+    CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('PORT','8080'), timeout=10)"
 
 CMD ["python", "/app/auto/apk_updater.py"]
