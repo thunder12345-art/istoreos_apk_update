@@ -122,11 +122,25 @@ def parse_prefixes(text):
 
 
 class ReleaseTarget:
-    def __init__(self, tag, patterns, archive, label):
+    def __init__(self, repo, tag, patterns, archive, subdir=None):
+        self.repo = repo or ""
         self.tag = tag
         self.patterns = patterns
         self.archive = archive
-        self.label = label
+        self.subdir = subdir or ""
+        self.label = "%s:%s" % (self.repo or "?", tag or "latest")
+
+    def effective_subdir(self):
+        if self.subdir:
+            return self.subdir
+        base = sanitize_name(self.repo.replace("/", "-"))
+        if self.tag:
+            base = "%s-%s" % (base, sanitize_name(self.tag))
+        return base or "download"
+
+    def relabel(self):
+        self.label = "%s:%s" % (self.repo or "?", self.tag or "latest")
+        return self
 
 
 class Config:
@@ -138,20 +152,23 @@ class Config:
         self.asset_patterns = [item.strip() for item in patterns.split(",") if item.strip()] or ["*.apk"]
         self.release_tag = env("RELEASE_TAG")
         self.include_prerelease = env_bool("INCLUDE_PRERELEASE", False)
-        self.targets = [ReleaseTarget(self.release_tag or None, self.asset_patterns, True,
-                                      self.release_tag or "latest")]
+        self.targets = [ReleaseTarget(self.repo, self.release_tag or None, self.asset_patterns, True)]
         for spec in env("EXTRA_TARGETS").split(";"):
             spec = spec.strip()
             if not spec:
                 continue
             parts = [part.strip() for part in spec.split("|")]
-            tag = parts[0] if parts and parts[0] else None
-            pattern_text = parts[1] if len(parts) > 1 else "*.apk"
-            archive = True
-            if len(parts) > 2:
-                archive = parts[2].lower() not in ("0", "false", "no", "off")
+            if len(parts) >= 4:
+                repo, tag, pattern_text, archive_text = parts[0], parts[1], parts[2], parts[3]
+            else:
+                repo = ""
+                tag = parts[0] if parts else ""
+                pattern_text = parts[1] if len(parts) > 1 else "*.apk"
+                archive_text = parts[2] if len(parts) > 2 else "1"
+            archive = archive_text.lower() not in ("0", "false", "no", "off")
             target_patterns = [item.strip() for item in pattern_text.split(",") if item.strip()] or ["*.apk"]
-            self.targets.append(ReleaseTarget(tag, target_patterns, archive, tag or "latest"))
+            self.targets.append(ReleaseTarget(repo or self.repo, tag or None,
+                                              target_patterns, archive))
         self.raw_url = env("RAW_URL")
         self.raw_path = env("RAW_PATH")
         self.raw_base = env("RAW_BASE", "https://raw.githubusercontent.com").rstrip("/")
@@ -178,7 +195,12 @@ class Config:
         if not isinstance(data, dict):
             return
         if data.get("repo"):
-            self.repo = str(data["repo"]).strip().strip("/")
+            new_repo = str(data["repo"]).strip().strip("/")
+            if new_repo != self.repo:
+                for target in self.targets:
+                    if not target.repo or target.repo == self.repo:
+                        target.repo = new_repo
+            self.repo = new_repo
         if data.get("download_dir"):
             self.download_dir = str(data["download_dir"]).strip()
         if data.get("check_interval_seconds") is not None:
@@ -206,15 +228,21 @@ class Config:
             for item in data["targets"]:
                 if not isinstance(item, dict):
                     continue
+                repo = str(item.get("repo") or "").strip().strip("/") or self.repo
                 tag = str(item.get("tag") or "").strip() or None
                 pats = item.get("patterns")
                 if isinstance(pats, str):
                     pats = [part.strip() for part in pats.split(",")]
                 pats = [str(part).strip() for part in (pats or []) if str(part).strip()] or ["*.apk"]
-                targets.append(ReleaseTarget(tag, pats, bool(item.get("archive", True)),
-                                             tag or "latest"))
+                subdir = str(item.get("subdir") or "").strip()
+                targets.append(ReleaseTarget(repo, tag, pats, bool(item.get("archive", True)),
+                                             subdir))
             if targets:
                 self.targets = targets
+        for target in self.targets:
+            if not target.repo:
+                target.repo = self.repo
+            target.relabel()
 
     def to_config_dict(self):
         return {
@@ -226,10 +254,18 @@ class Config:
             "proxy_prefix": ",".join(prefix.rstrip("/") for prefix in self.proxy_prefixes),
             "github_token": self.token,
             "include_prerelease": self.include_prerelease,
-            "targets": [{"tag": target.tag or "", "patterns": list(target.patterns),
-                         "archive": target.archive} for target in self.targets],
+            "targets": [{"repo": target.repo, "tag": target.tag or "",
+                         "patterns": list(target.patterns), "archive": target.archive,
+                         "subdir": target.effective_subdir()} for target in self.targets],
             "mode": self.mode,
         }
+
+    def target_subdir(self, target):
+        return target.effective_subdir()
+
+    def target_dir(self, target):
+        subdir = target.effective_subdir()
+        return os.path.join(self.download_dir, subdir) if subdir else self.download_dir
 
     def target_desc(self):
         if self.mode == "raw":
@@ -237,9 +273,9 @@ class Config:
                 self.raw_base, self.repo or "?", self.branch, (self.raw_path or "?").lstrip("/"))
         parts = []
         for target in self.targets:
-            parts.append("[%s] tag=%s patterns=%s archive=%d" % (
+            parts.append("[%s] tag=%s patterns=%s archive=%d dir=%s" % (
                 target.label, target.tag or "latest", ",".join(target.patterns),
-                1 if target.archive else 0))
+                1 if target.archive else 0, target.effective_subdir()))
         return "%s | %s" % (self.repo or "?", " ; ".join(parts))
 
     def default_stem(self):
@@ -309,12 +345,12 @@ def api_get_json(cfg, path):
     return json.loads(payload.decode("utf-8", "replace"))
 
 
-def fetch_release(cfg, tag=None):
+def fetch_release(cfg, repo, tag=None):
     if tag:
         return api_get_json(cfg, "/repos/%s/releases/tags/%s"
-                            % (cfg.repo, urllib.parse.quote(tag)))
-    releases = api_get_json(cfg, "/repos/%s/releases?per_page=20" % cfg.repo)
-    excluded = {target.tag for target in cfg.targets if target.tag}
+                            % (repo, urllib.parse.quote(tag)))
+    releases = api_get_json(cfg, "/repos/%s/releases?per_page=20" % repo)
+    excluded = {target.tag for target in cfg.targets if target.tag and target.repo == repo}
     candidates = []
     for release in releases:
         if release.get("draft"):
@@ -325,7 +361,7 @@ def fetch_release(cfg, tag=None):
             continue
         candidates.append(release)
     if not candidates:
-        raise RuntimeError("no usable release found for %s" % cfg.repo)
+        raise RuntimeError("no usable release found for %s" % repo)
     candidates.sort(key=lambda item: (item.get("published_at") or item.get("created_at") or "",
                                       item.get("id") or 0), reverse=True)
     return candidates[0]
@@ -362,8 +398,10 @@ def previous_entry(assets_state, key, name):
 
 
 def plan_release(cfg, state, target):
-    release = fetch_release(cfg, target.tag)
+    repo = target.repo or cfg.repo
+    release = fetch_release(cfg, repo, target.tag)
     tag = version_label(release) or target.tag or "unknown"
+    subdir = cfg.target_subdir(target)
     matched = pick_assets(release, target.patterns)
     if not matched:
         names = ", ".join(item.get("name", "?") for item in release.get("assets") or []) or "(none)"
@@ -374,13 +412,13 @@ def plan_release(cfg, state, target):
     items = []
     current = []
     for asset in matched:
-        key = "%s:%s" % (tag, asset["name"])
+        key = "%s:%s:%s" % (repo, tag, asset["name"])
         _, previous = previous_entry(assets_state, key, asset["name"])
         if previous.get("asset_id") == asset.get("id") \
                 and previous.get("asset_updated_at") == asset.get("updated_at") \
                 and previous.get("tag") == tag:
             probe = {"asset_name": asset["name"], "archive": target.archive,
-                     "matched_total": len(matched)}
+                     "matched_total": len(matched), "subdir": subdir}
             if files_present(cfg, probe, previous):
                 current.append(asset["name"])
                 continue
@@ -388,22 +426,24 @@ def plan_release(cfg, state, target):
                               cfg.proxy_prefixes)
         fallback = None
         if cfg.token and asset.get("id"):
-            fallback = "%s/repos/%s/releases/assets/%s" % (cfg.api_base, cfg.repo, asset["id"])
+            fallback = "%s/repos/%s/releases/assets/%s" % (cfg.api_base, repo, asset["id"])
         items.append({"asset_name": asset["name"], "state_key": key,
                       "version": version_label(release),
                       "urls": [url for url in urls if url],
                       "expected_size": asset.get("size"), "expected_digest": asset.get("digest"),
                       "fallback_url": fallback,
                       "archive": target.archive, "matched_total": len(matched),
+                      "subdir": subdir,
                       "meta": {"asset_id": asset.get("id"),
                                "asset_updated_at": asset.get("updated_at"),
-                               "tag": tag, "url": asset.get("browser_download_url")}})
+                               "tag": tag, "repo": repo,
+                               "url": asset.get("browser_download_url")}})
     if not items:
         return {"action": "none", "tag": tag,
                 "reason": "[%s] current: %s %s (%s)"
-                % (target.label, cfg.repo, tag, ", ".join(current))}
+                % (target.label, repo, tag, ", ".join(current))}
     return {"action": "download", "items": items,
-            "description": "[%s] %s tag %s -> %s" % (target.label, cfg.repo, tag,
+            "description": "[%s] %s tag %s -> %s" % (target.label, repo, tag,
                                                      ", ".join(item["asset_name"] for item in items)),
             "tag": tag, "release_url": release.get("html_url")}
 
@@ -482,14 +522,15 @@ def plan_raw(cfg, state):
             and (length is None or previous.get("size") == length):
         same = True
     if same and previous.get("sha256") \
-            and files_present(cfg, {"asset_name": name, "archive": True, "matched_total": 1},
-                              previous):
+            and files_present(cfg, {"asset_name": name, "archive": True, "matched_total": 1,
+                                    "subdir": ""}, previous):
         return {"action": "none", "reason": "[raw] current: %s (etag/last-modified unchanged)" % url}
     version = fetch_version_label(cfg) or label_from_last_modified(last_modified)
     return {"action": "download", "matched_total": 1,
             "items": [{"asset_name": name, "state_key": key, "version": version,
                        "urls": candidates, "expected_size": length, "expected_digest": None,
                        "fallback_url": None, "archive": True, "matched_total": 1,
+                       "subdir": "",
                        "meta": {"etag": etag, "last_modified": last_modified, "url": url}}],
             "description": "[raw] %s (%s bytes)" % (url, length)}
 
@@ -519,10 +560,15 @@ def download_once(cfg, url, dest, expected_size=None, expected_digest=None, extr
     return digest.hexdigest(), size
 
 
-def prune_old(cfg, stem, ext):
+def item_dir(cfg, item):
+    subdir = item.get("subdir") or ""
+    return os.path.join(cfg.download_dir, subdir) if subdir else cfg.download_dir
+
+
+def prune_old(cfg, work_dir, stem, ext):
     if cfg.keep_versions <= 0:
         return []
-    pattern = os.path.join(cfg.download_dir, glob.escape(stem) + "-*" + glob.escape(ext))
+    pattern = os.path.join(work_dir, glob.escape(stem) + "-*" + glob.escape(ext))
     files = [path for path in glob.glob(pattern) if os.path.isfile(path)]
     files.sort(key=os.path.getmtime, reverse=True)
     removed = []
@@ -561,13 +607,14 @@ def fetch_item(cfg, item, part):
 
 def files_present(cfg, item, previous):
     name = item["asset_name"]
+    work_dir = item_dir(cfg, item)
     if not item.get("archive", True):
-        return os.path.exists(os.path.join(cfg.download_dir, name))
+        return os.path.exists(os.path.join(work_dir, name))
     file_name = previous.get("file")
-    if not file_name or not os.path.exists(os.path.join(cfg.download_dir, file_name)):
+    if not file_name or not os.path.exists(os.path.join(work_dir, file_name)):
         return False
     stable = cfg.stable_for(name, item.get("matched_total") or 1)
-    if stable and not os.path.exists(os.path.join(cfg.download_dir, stable)):
+    if stable and not os.path.exists(os.path.join(work_dir, stable)):
         return False
     return True
 
@@ -582,9 +629,15 @@ def apply_download(cfg, state, plan):
         archive = item.get("archive", True)
         matched_total = item.get("matched_total") or 1
         old_key, previous = previous_entry(assets_state, key, name)
+        work_dir = item_dir(cfg, item)
+        try:
+            os.makedirs(work_dir, exist_ok=True)
+        except OSError as error:
+            errors.append("%s: cannot create %s: %s" % (name, work_dir, error))
+            continue
         ext = os.path.splitext(name)[1] or ".apk"
         stem = cfg.stem_for(name, matched_total)
-        part = os.path.join(cfg.download_dir, ".%s.download.part" % (stem if archive else name))
+        part = os.path.join(work_dir, ".%s.download.part" % (stem if archive else name))
         sha, size, last_error = fetch_item(cfg, item, part)
         if sha is None:
             if os.path.exists(part):
@@ -608,16 +661,18 @@ def apply_download(cfg, state, plan):
         if archive:
             version = sanitize_name(item.get("version")) or ("sha-" + sha[:8])
             target_name = "%s-%s%s" % (stem, version, ext)
-            target = os.path.join(cfg.download_dir, target_name)
+            target = os.path.join(work_dir, target_name)
             if os.path.exists(target):
                 version = "%s-%s" % (version, time.strftime("%Y%m%d%H%M%S"))
                 target_name = "%s-%s%s" % (stem, version, ext)
-                target = os.path.join(cfg.download_dir, target_name)
+                target = os.path.join(work_dir, target_name)
         else:
             target_name = name
-            target = os.path.join(cfg.download_dir, target_name)
+            target = os.path.join(work_dir, target_name)
         os.replace(part, target)
-        log("saved %s (%d bytes, sha256 %s)" % (target_name, size, sha[:12]))
+        log("saved %s (%d bytes, sha256 %s)" % (
+            os.path.join(item.get("subdir") or "", target_name) if item.get("subdir")
+            else target_name, size, sha[:12]))
 
         if archive:
             stable = cfg.stable_for(name, matched_total)
@@ -626,13 +681,14 @@ def apply_download(cfg, state, plan):
                     log("STABLE_NAME ignored: %d assets matched, keeping original filenames"
                         % matched_total)
                     stable_warned = True
-                stable_path = os.path.join(cfg.download_dir, stable)
+                stable_path = os.path.join(work_dir, stable)
                 temp = stable_path + ".tmp"
                 shutil.copyfile(target, temp)
                 os.replace(temp, stable_path)
-                log("updated %s" % stable)
+                log("updated %s" % (os.path.join(item.get("subdir") or "", stable)
+                                    if item.get("subdir") else stable))
 
-            removed = prune_old(cfg, stem, ext)
+            removed = prune_old(cfg, work_dir, stem, ext)
             if removed:
                 log("removed old versions: %s" % ", ".join(removed))
 
@@ -704,6 +760,13 @@ def validate_config_update(cfg, data):
             patterns = [part for part in patterns.split(",") if part.strip()]
         if not [part for part in (patterns or []) if str(part).strip()]:
             return "每个下载目标的匹配规则不能为空"
+        target_repo = str(item.get("repo") or "").strip().strip("/")
+        if target_repo and "/" not in target_repo:
+            return "目标仓库格式应为 owner/repo（或留空使用默认仓库）"
+        subdir = str(item.get("subdir") or "").strip()
+        if subdir and ("/" in subdir or "\\" in subdir or subdir in (".", "..")
+                       or subdir.startswith(".")):
+            return "子文件夹名不能包含 / 且不能以 . 开头"
     try:
         interval = int(data.get("check_interval_seconds") or cfg.interval)
     except (TypeError, ValueError):
@@ -733,11 +796,67 @@ def clean_config_payload(cfg, data):
             patterns = [part.strip() for part in patterns.split(",")]
         patterns = [str(part).strip() for part in (patterns or []) if str(part).strip()]
         cleaned["targets"].append({
+            "repo": str(item.get("repo") or "").strip().strip("/"),
             "tag": str(item.get("tag") or "").strip(),
             "patterns": patterns or ["*.apk"],
             "archive": bool(item.get("archive", True)),
+            "subdir": str(item.get("subdir") or "").strip(),
         })
     return cleaned
+
+
+def is_new_state_key(key):
+    return key.count(":") >= 2 and "/" in key.split(":", 1)[0]
+
+
+def migrate_legacy(cfg, state):
+    if cfg.mode != "release":
+        return False
+    assets_state = state.get("assets") or {}
+    claims = {}
+    for key, entry in list(assets_state.items()):
+        if key.startswith("raw:") or not entry.get("asset_id"):
+            continue
+        if is_new_state_key(key):
+            continue
+        name = key.rsplit(":", 1)[-1] if ":" in key else key
+        for target in cfg.targets:
+            if any(fnmatch.fnmatch(name.lower(), pattern.lower())
+                   for pattern in target.patterns):
+                claims[key] = (target, name)
+                break
+    changed = False
+    for key, (target, name) in claims.items():
+        entry = assets_state.get(key)
+        if entry is None:
+            continue
+        subdir = cfg.target_subdir(target)
+        dest_dir = os.path.join(cfg.download_dir, subdir) if subdir else cfg.download_dir
+        names = []
+        if entry.get("file"):
+            names.append(entry["file"])
+        if name not in names:
+            names.append(name)
+        moved = False
+        for file_name in names:
+            src = os.path.join(cfg.download_dir, file_name)
+            dest = os.path.join(dest_dir, file_name)
+            if os.path.isfile(src) and not os.path.exists(dest):
+                os.makedirs(dest_dir, exist_ok=True)
+                try:
+                    os.replace(src, dest)
+                    log("moved %s -> %s/" % (file_name, subdir or "."))
+                    moved = True
+                except OSError as error:
+                    log("move failed %s: %s" % (file_name, error))
+        new_key = "%s:%s:%s" % (target.repo, entry.get("tag") or target.tag or "latest", name)
+        if new_key != key and new_key not in assets_state:
+            assets_state[new_key] = entry
+            assets_state.pop(key, None)
+            changed = True
+        elif moved:
+            changed = True
+    return changed
 
 
 class Updater:
@@ -750,6 +869,8 @@ class Updater:
         data = self.load_config()
         self.cfg = Config(data)
         self.state = load_json(self.state_path) or {}
+        if migrate_legacy(self.cfg, self.state):
+            save_json(self.state_path, self.state)
 
     def load_config(self):
         data = load_json(self.config_path)
@@ -817,24 +938,29 @@ class Updater:
     def status(self):
         cfg, state = self.snapshot()
         files = []
-        try:
-            entries = sorted(os.scandir(cfg.download_dir), key=lambda entry: entry.name.lower())
+
+        def collect(directory, subdir):
+            try:
+                entries = sorted(os.scandir(directory), key=lambda entry: entry.name.lower())
+            except OSError:
+                return
             for entry in entries:
-                if not entry.is_file() or entry.name.startswith("."):
+                if entry.name.startswith("."):
                     continue
-                info = entry.stat()
-                files.append({"name": entry.name, "size": info.st_size,
-                              "mtime": time.strftime("%Y-%m-%d %H:%M:%S",
-                                                     time.localtime(info.st_mtime))})
-        except OSError:
-            pass
+                if entry.is_file():
+                    info = entry.stat()
+                    files.append({"name": entry.name, "dir": subdir, "size": info.st_size,
+                                  "mtime": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                         time.localtime(info.st_mtime))})
+                elif entry.is_dir():
+                    collect(entry.path, entry.name)
+
+        collect(cfg.download_dir, "")
         last = float(state.get("last_check_ts") or 0)
         tags = state.get("tags") or {}
         main_tag = None
         if cfg.mode == "release" and cfg.targets:
             main_tag = tags.get("release:%s" % cfg.targets[0].label)
-        if not main_tag:
-            main_tag = tags.get(cfg.targets[0].label) if cfg.targets else None
         if not main_tag:
             main_tag = state.get("tag")
         result = {

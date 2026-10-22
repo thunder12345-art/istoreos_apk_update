@@ -21,7 +21,7 @@ services:
       RELEASE_TAG: "${RELEASE_TAG:-}"
       INCLUDE_PRERELEASE: "${INCLUDE_PRERELEASE:-0}"
       ASSET_PATTERN: "${ASSET_PATTERN:-leanback-armeabi_v7a.apk,mobile-arm64_v8a.apk}"
-      EXTRA_TARGETS: "${EXTRA_TARGETS:-module|*.apk|0}"
+      EXTRA_TARGETS: "${EXTRA_TARGETS:-module|*.apk|0;pass-with-high-score/universal-installer||*.apk|1}"
 
       RAW_PATH: "${RAW_PATH:-}"
       RAW_URL: "${RAW_URL:-}"

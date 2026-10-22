@@ -79,21 +79,24 @@ border-radius:8px;padding:10px 16px;display:none;max-width:70vw}
 </section>
 
 <section>
-  <h2>下载目标（tag + 匹配规则）</h2>
+  <h2>下载目标（仓库 + tag + 匹配规则，各自保存到独立子文件夹）</h2>
+  <div style="overflow-x:auto">
   <table>
-    <thead><tr><th style="width:22%">tag（留空=最新）</th><th>文件匹配（逗号分隔）</th>
-    <th style="width:110px">版本化保存</th><th style="width:70px"></th></tr></thead>
+    <thead><tr><th style="width:17%">仓库（留空=默认）</th><th style="width:12%">tag（留空=最新）</th>
+    <th>文件匹配（逗号分隔）</th><th style="width:92px">版本化</th>
+    <th style="width:16%">子文件夹（留空=自动）</th><th style="width:60px"></th></tr></thead>
     <tbody id="targets"></tbody>
   </table>
+  </div>
   <div style="margin-top:10px"><button onclick="addTarget()">添加目标</button></div>
-  <div class="hint">例：tag 留空 + leanback-armeabi_v7a.apk,mobile-arm64_v8a.apk → 版本化；
-  tag 填 module + *.apk + 不勾选版本化 → 按原始文件名保存</div>
+  <div class="hint">示例：tag 留空 + leanback-armeabi_v7a.apk,mobile-arm64_v8a.apk + 版本化 → 自动建子文件夹；
+  仓库填 pass-with-high-score/universal-installer 可跨仓库下载；子文件夹留空时自动按「仓库-tag」命名</div>
 </section>
 
 <section>
   <h2>已下载文件</h2>
   <table>
-    <thead><tr><th>文件名</th><th style="width:110px">大小</th><th style="width:180px">修改时间</th></tr></thead>
+    <thead><tr><th style="width:20%">目录</th><th>文件名</th><th style="width:110px">大小</th><th style="width:180px">修改时间</th></tr></thead>
     <tbody id="files"></tbody>
   </table>
 </section>
@@ -150,20 +153,24 @@ function fmtLeft(sec){
   return (h? h+"时" : "") + (m? m+"分" : "") + s + "秒";
 }
 
-function addTargetRow(tag, patterns, archive){
+function addTargetRow(repo, tag, patterns, archive, subdir){
   const tr = document.createElement("tr");
-  tr.innerHTML = `<td><input type="text" class="t-tag" placeholder="留空=最新版本"></td>
+  tr.innerHTML = `<td><input type="text" class="t-repo" placeholder="默认仓库"></td>
+    <td><input type="text" class="t-tag" placeholder="最新"></td>
     <td><input type="text" class="t-patterns"></td>
     <td><div class="check"><input type="checkbox" class="t-archive"><span>保留版本</span></div></td>
+    <td><input type="text" class="t-subdir" placeholder="自动"></td>
     <td><button class="danger" onclick="this.closest('tr').remove(); formDirty=true;">删除</button></td>`;
+  tr.querySelector(".t-repo").value = repo || "";
   tr.querySelector(".t-tag").value = tag || "";
   tr.querySelector(".t-patterns").value = (patterns || []).join(",");
   tr.querySelector(".t-archive").checked = !!archive;
+  tr.querySelector(".t-subdir").value = subdir || "";
   tr.querySelectorAll("input").forEach(el => el.addEventListener("input", () => formDirty = true));
   $("targets").appendChild(tr);
 }
 
-function addTarget(){ addTargetRow("", "", true); formDirty = true; }
+function addTarget(){ addTargetRow("", "", "", true, ""); formDirty = true; }
 
 function fillConfig(cfg){
   if (formDirty) return;
@@ -176,16 +183,18 @@ function fillConfig(cfg){
   $("f-token").value = cfg.github_token || "";
   $("f-prerelease").checked = !!cfg.include_prerelease;
   $("targets").innerHTML = "";
-  (cfg.targets || []).forEach(t => addTargetRow(t.tag, t.patterns, t.archive));
+  (cfg.targets || []).forEach(t => addTargetRow(t.repo, t.tag, t.patterns, t.archive, t.subdir));
 }
 
 function collectConfig(){
   const targets = [];
   $("targets").querySelectorAll("tr").forEach(tr => {
     targets.push({
+      repo: tr.querySelector(".t-repo").value.trim(),
       tag: tr.querySelector(".t-tag").value.trim(),
       patterns: tr.querySelector(".t-patterns").value.split(",").map(s => s.trim()).filter(Boolean),
       archive: tr.querySelector(".t-archive").checked,
+      subdir: tr.querySelector(".t-subdir").value.trim(),
     });
   });
   const hours = parseFloat($("f-interval").value) || 24;
@@ -241,10 +250,11 @@ async function refresh(){
     tbody.innerHTML = "";
     (st.files || []).forEach(f => {
       const tr = document.createElement("tr");
-      tr.innerHTML = "<td></td><td></td><td></td>";
-      tr.children[0].textContent = f.name;
-      tr.children[1].textContent = fmtSize(f.size);
-      tr.children[2].textContent = f.mtime;
+      tr.innerHTML = "<td></td><td></td><td></td><td></td>";
+      tr.children[0].textContent = f.dir ? f.dir + "/" : "";
+      tr.children[1].textContent = f.name;
+      tr.children[2].textContent = fmtSize(f.size);
+      tr.children[3].textContent = f.mtime;
       tbody.appendChild(tr);
     });
     $("logs").textContent = (st.logs || []).join("\n");
