@@ -53,11 +53,13 @@ if git diff --cached --quiet; then
 else
     git commit -m "sync upstream $TS"
 fi
-if git remote | grep -q .; then
-    git push origin main || echo "   !! push failed (check credentials), local commit is safe"
-else
-    echo "   (no remote configured, skip push)"
-fi
+REMOTE_URL="$(git remote get-url origin 2>/dev/null || true)"
+case "$REMOTE_URL" in
+    ""|*".bundle")
+        echo "   (origin is local/none, skip push)" ;;
+    *)
+        git push origin main || echo "   !! push failed (check credentials), local commit is safe" ;;
+esac
 
 echo "== [5/6] rebuild image =="
 compose build
