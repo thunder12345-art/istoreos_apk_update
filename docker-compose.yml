@@ -1,0 +1,45 @@
+services:
+  apk-updater:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: apk-updater:latest
+    container_name: apk-updater
+    restart: unless-stopped
+    volumes:
+      - "${APK_DIR:-/mnt/sata1-2/apk}:/download"
+      - ./data:/data
+    environment:
+      TZ: "Asia/Shanghai"
+
+      MODE: "release"
+      GITHUB_REPO: "owner/repo"
+      RELEASE_TAG: ""
+      INCLUDE_PRERELEASE: "0"
+      ASSET_PATTERN: "*.apk"
+
+      RAW_PATH: ""
+      RAW_URL: ""
+      RAW_BASE: "https://raw.githubusercontent.com"
+      GITHUB_BRANCH: "main"
+      VERSION_URL: ""
+
+      DOWNLOAD_DIR: "/download"
+      FILE_STEM: ""
+      STABLE_NAME: "latest.apk"
+      KEEP_VERSIONS: "3"
+
+      CHECK_INTERVAL_SECONDS: "3600"
+      RUN_ON_START: "1"
+      RUN_ONCE: "0"
+      REQUEST_TIMEOUT: "30"
+
+      GITHUB_TOKEN: ""
+      PROXY_PREFIX: "https://gh-proxy.com/"
+      STATE_FILE: "/data/state.json"
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
