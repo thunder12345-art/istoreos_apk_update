@@ -6,6 +6,14 @@ cd "$(dirname "$0")/.."
 BUNDLE="${1:-/mnt/sata1-2/docker/apk-updater.bundle}"
 TS="$(date +%Y%m%d-%H%M%S)"
 
+compose() {
+    if docker compose version >/dev/null 2>&1; then
+        docker compose "$@"
+    else
+        docker-compose "$@"
+    fi
+}
+
 echo "== [0/6] ensure git identity =="
 git config user.email >/dev/null 2>&1 || git config user.email "nas@local"
 git config user.name >/dev/null 2>&1 || git config user.name "iStoreOS NAS"
@@ -52,10 +60,10 @@ else
 fi
 
 echo "== [5/6] rebuild image =="
-docker compose build
+compose build
 
 echo "== [6/6] start container =="
-docker compose up -d
+compose up -d
 
 echo ""
 echo "done. logs:  docker logs --tail 30 apk-updater"
