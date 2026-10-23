@@ -181,7 +181,9 @@ class Config:
             stable = None
         self.stable_name = stable
         self.keep_versions = env_int("KEEP_VERSIONS", 1)
-        self.interval = max(env_int("CHECK_INTERVAL_SECONDS", 86400), 30)
+        self.interval = max(0, env_int("CHECK_INTERVAL_SECONDS", 86400))
+        if 0 < self.interval < 30:
+            self.interval = 30
         self.run_on_start = env_bool("RUN_ON_START", True)
         self.run_once = env_bool("RUN_ONCE", False)
         self.timeout = env_int("REQUEST_TIMEOUT", 30)
@@ -205,7 +207,8 @@ class Config:
             self.download_dir = str(data["download_dir"]).strip()
         if data.get("check_interval_seconds") is not None:
             try:
-                self.interval = max(int(data["check_interval_seconds"]), 30)
+                value = max(0, int(data["check_interval_seconds"]))
+                self.interval = value if value == 0 else max(value, 30)
             except (TypeError, ValueError):
                 pass
         if data.get("keep_versions") is not None:
@@ -581,6 +584,49 @@ def prune_old(cfg, work_dir, stem, ext):
     return removed
 
 
+def remove_versioned_files(cfg, work_dir, name):
+    stems = set()
+    stem = sanitize_name(os.path.splitext(name)[0])
+    if stem:
+        stems.add(stem)
+    if cfg.file_stem:
+        stems.add(sanitize_name(cfg.file_stem))
+    ext = os.path.splitext(name)[1] or ".apk"
+    removed = []
+    for stem in stems:
+        pattern = os.path.join(work_dir, glob.escape(stem) + "-*" + glob.escape(ext))
+        for path in glob.glob(pattern):
+            if os.path.isfile(path) and os.path.basename(path) != name:
+                try:
+                    os.remove(path)
+                    removed.append(os.path.basename(path))
+                except OSError:
+                    pass
+    return removed
+
+
+def cleanup_target_versioned(cfg, state, target):
+    assets_state = state.get("assets") or {}
+    repo = target.repo or cfg.repo
+    work_dir = cfg.target_dir(target)
+    if not os.path.isdir(work_dir):
+        return []
+    removed = []
+    for key, entry in assets_state.items():
+        if key.startswith("raw:"):
+            continue
+        if is_new_state_key(key) and not key.startswith(repo + ":"):
+            continue
+        name = key.rsplit(":", 1)[-1] if ":" in key else key
+        if not any(fnmatch.fnmatch(name.lower(), pattern.lower())
+                   for pattern in target.patterns):
+            continue
+        removed.extend(remove_versioned_files(cfg, work_dir, name))
+        if entry.get("file") != name and os.path.isfile(os.path.join(work_dir, name)):
+            entry["file"] = name
+    return removed
+
+
 def fetch_item(cfg, item, part):
     last_error = None
     for url in item.get("urls") or []:
@@ -648,10 +694,16 @@ def apply_download(cfg, state, plan):
         if previous.get("sha256") == sha and files_present(cfg, item, previous):
             os.remove(part)
             log("%s: content identical (sha256 %s), nothing to do" % (name, sha[:12]))
+            if not archive:
+                removed = remove_versioned_files(cfg, work_dir, name)
+                if removed:
+                    log("removed old versions: %s" % ", ".join(removed))
             merged = {field: previous[field] for field in
                       ("version", "file", "sha256", "size", "downloaded_at_iso")
                       if field in previous}
             merged.update(item["meta"])
+            if not archive:
+                merged["file"] = name
             assets_state[key] = merged
             if old_key != key:
                 assets_state.pop(old_key, None)
@@ -673,6 +725,11 @@ def apply_download(cfg, state, plan):
         log("saved %s (%d bytes, sha256 %s)" % (
             os.path.join(item.get("subdir") or "", target_name) if item.get("subdir")
             else target_name, size, sha[:12]))
+
+        if not archive:
+            removed = remove_versioned_files(cfg, work_dir, name)
+            if removed:
+                log("removed old versions: %s" % ", ".join(removed))
 
         if archive:
             stable = cfg.stable_for(name, matched_total)
@@ -705,18 +762,22 @@ def apply_download(cfg, state, plan):
 
 def check_once(cfg, state):
     if cfg.mode == "raw":
-        jobs = [("raw", lambda: plan_raw(cfg, state))]
+        jobs = [("raw", lambda: plan_raw(cfg, state), None)]
     else:
         jobs = [("release:%s" % target.label,
-                 (lambda target=target: plan_release(cfg, state, target)))
+                 (lambda target=target: plan_release(cfg, state, target)), target)
                 for target in cfg.targets]
     errors = []
-    for label, planner in jobs:
+    for label, planner, target in jobs:
         try:
             plan = planner()
             if plan.get("tag"):
                 state.setdefault("tags", {})[label] = plan["tag"]
             if plan["action"] == "none":
+                if target is not None and not target.archive:
+                    removed = cleanup_target_versioned(cfg, state, target)
+                    if removed:
+                        log("removed old versions: %s" % ", ".join(removed))
                 log("no update: %s" % plan.get("reason"))
                 continue
             log("update found: %s" % plan.get("description"))
@@ -767,12 +828,17 @@ def validate_config_update(cfg, data):
         if subdir and ("/" in subdir or "\\" in subdir or subdir in (".", "..")
                        or subdir.startswith(".")):
             return "子文件夹名不能包含 / 且不能以 . 开头"
+    raw_interval = data.get("check_interval_seconds")
+    if raw_interval is None:
+        raw_interval = cfg.interval
     try:
-        interval = int(data.get("check_interval_seconds") or cfg.interval)
+        interval = int(raw_interval)
     except (TypeError, ValueError):
         return "检查间隔必须是数字"
-    if interval < 30:
-        return "检查间隔至少 30 秒"
+    if interval < 0:
+        return "检查间隔不能为负数（0 = 不自动检查）"
+    if 0 < interval < 30:
+        return "检查间隔至少 30 秒（0 = 不自动检查）"
     return ""
 
 
@@ -780,7 +846,9 @@ def clean_config_payload(cfg, data):
     cleaned = {
         "repo": str(data.get("repo") or cfg.repo).strip().strip("/"),
         "download_dir": str(data.get("download_dir") or cfg.download_dir).strip().rstrip("/") or "/",
-        "check_interval_seconds": int(data.get("check_interval_seconds") or cfg.interval),
+        "check_interval_seconds": int(data.get("check_interval_seconds")
+                                      if data.get("check_interval_seconds") is not None
+                                      else cfg.interval),
         "keep_versions": int(data.get("keep_versions") if data.get("keep_versions") is not None
                              else cfg.keep_versions),
         "stable_name": str(data.get("stable_name") if data.get("stable_name") is not None else "auto"),
@@ -894,7 +962,8 @@ class Updater:
             os.makedirs(self.cfg.download_dir, exist_ok=True)
         except OSError as error:
             log("warning: cannot create %s: %s" % (self.cfg.download_dir, error))
-        self.trigger.set()
+        if self.cfg.interval > 0:
+            self.trigger.set()
         return self.cfg
 
     def snapshot(self):
@@ -905,9 +974,13 @@ class Updater:
         first = True
         while not self.stop.is_set():
             cfg, _ = self.snapshot()
-            if first and not cfg.run_on_start and not cfg.run_once:
-                log("RUN_ON_START=0, waiting %ss before first check" % cfg.interval)
-            else:
+            skip_first = first and not cfg.run_once and (cfg.interval <= 0 or not cfg.run_on_start)
+            if first and not cfg.run_once:
+                if cfg.interval <= 0:
+                    log("自动检查已关闭（检查间隔=0），仅手动检查生效")
+                elif not cfg.run_on_start:
+                    log("RUN_ON_START=0, waiting %ss before first check" % cfg.interval)
+            if not skip_first:
                 local_state = self.snapshot()[1]
                 try:
                     check_once(cfg, local_state)
@@ -926,6 +999,12 @@ class Updater:
             self.wait_next(cfg.interval)
 
     def wait_next(self, interval):
+        if interval <= 0:
+            while not self.stop.is_set():
+                if self.trigger.wait(timeout=1):
+                    self.trigger.clear()
+                    return
+            return
         deadline = time.time() + interval
         while not self.stop.is_set():
             remaining = deadline - time.time()
@@ -969,7 +1048,9 @@ class Updater:
             "config": cfg.to_config_dict(),
             "target_desc": cfg.target_desc(),
             "last_check_iso": state.get("last_check_iso"),
-            "next_check_seconds": max(0, int(last + cfg.interval - time.time())) if last else None,
+            "next_check_seconds": (max(0, int(last + cfg.interval - time.time())) if last else None)
+                                  if cfg.interval > 0 else None,
+            "auto_check_enabled": cfg.interval > 0,
             "tag": main_tag,
             "tags": tags,
             "assets": state.get("assets") or {},
@@ -982,7 +1063,7 @@ class Updater:
     def health(self):
         cfg, state = self.snapshot()
         last = float(state.get("last_check_ts") or 0)
-        if last:
+        if last and cfg.interval > 0:
             healthy = (time.time() - last) <= max(2 * cfg.interval, 1800)
         else:
             healthy = True
