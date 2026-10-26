@@ -141,12 +141,13 @@ def name_skeleton(name):
 
 
 class ReleaseTarget:
-    def __init__(self, repo, tag, patterns, archive, subdir=None):
+    def __init__(self, repo, tag, patterns, archive, subdir=None, cleanup=None):
         self.repo = repo or ""
         self.tag = tag
         self.patterns = patterns
         self.archive = archive
         self.subdir = subdir or ""
+        self.cleanup = [item for item in (cleanup or []) if item]
         self.label = "%s:%s" % (self.repo or "?", tag or "latest")
 
     def effective_subdir(self):
@@ -177,8 +178,11 @@ class Config:
             if not spec:
                 continue
             parts = [part.strip() for part in spec.split("|")]
-            if len(parts) >= 4:
-                repo, tag, pattern_text, archive_text = parts[0], parts[1], parts[2], parts[3]
+            cleanup_text = ""
+            if len(parts) >= 5:
+                repo, tag, pattern_text, archive_text, cleanup_text = parts[:5]
+            elif len(parts) >= 4:
+                repo, tag, pattern_text, archive_text = parts[:4]
             else:
                 repo = ""
                 tag = parts[0] if parts else ""
@@ -186,8 +190,10 @@ class Config:
                 archive_text = parts[2] if len(parts) > 2 else "1"
             archive = archive_text.lower() not in ("0", "false", "no", "off")
             target_patterns = [item.strip() for item in pattern_text.split(",") if item.strip()] or ["*.apk"]
+            cleanup_patterns = [item.strip() for item in cleanup_text.split(",") if item.strip()]
             self.targets.append(ReleaseTarget(repo or self.repo, tag or None,
-                                              target_patterns, archive))
+                                              target_patterns, archive, None,
+                                              cleanup_patterns))
         self.raw_url = env("RAW_URL")
         self.raw_path = env("RAW_PATH")
         self.raw_base = env("RAW_BASE", "https://raw.githubusercontent.com").rstrip("/")
@@ -266,8 +272,12 @@ class Config:
                     pats = [part.strip() for part in pats.split(",")]
                 pats = [str(part).strip() for part in (pats or []) if str(part).strip()] or ["*.apk"]
                 subdir = str(item.get("subdir") or "").strip()
+                cleanup = item.get("cleanup")
+                if isinstance(cleanup, str):
+                    cleanup = [part.strip() for part in cleanup.split(",")]
+                cleanup = [str(part).strip() for part in (cleanup or []) if str(part).strip()]
                 targets.append(ReleaseTarget(repo, tag, pats, bool(item.get("archive", True)),
-                                             subdir))
+                                             subdir, cleanup))
             if targets:
                 self.targets = targets
         for target in self.targets:
@@ -288,7 +298,8 @@ class Config:
             "include_prerelease": self.include_prerelease,
             "targets": [{"repo": target.repo, "tag": target.tag or "",
                          "patterns": list(target.patterns), "archive": target.archive,
-                         "subdir": target.effective_subdir()} for target in self.targets],
+                         "subdir": target.effective_subdir(),
+                         "cleanup": list(target.cleanup)} for target in self.targets],
             "mode": self.mode,
         }
 
@@ -666,10 +677,19 @@ def cleanup_target_versioned(cfg, state, target):
     return removed
 
 
+def stale_group_keys(target, name):
+    if target.cleanup:
+        return [pattern for pattern in target.cleanup
+                if fnmatch.fnmatch(name.lower(), pattern.lower())]
+    return [name_skeleton(name)]
+
+
 def cleanup_stale_names(cfg, state, target, repo, current_names):
     current = set(current_names)
-    skeletons = {name_skeleton(name) for name in current_names}
-    if not skeletons:
+    current_groups = set()
+    for name in current_names:
+        current_groups.update(stale_group_keys(target, name))
+    if not current_groups:
         return []
     assets_state = state.get("assets") or {}
     work_dir = cfg.target_dir(target)
@@ -685,7 +705,7 @@ def cleanup_stale_names(cfg, state, target, repo, current_names):
         if not any(fnmatch.fnmatch(name.lower(), pattern.lower())
                    for pattern in target.patterns):
             continue
-        if name_skeleton(name) not in skeletons:
+        if not (set(stale_group_keys(target, name)) & current_groups):
             continue
         for file_name in {entry.get("file"), name}:
             if not file_name or file_name in current:
@@ -907,6 +927,15 @@ def validate_config_update(cfg, data):
         if subdir and ("/" in subdir or "\\" in subdir or subdir in (".", "..")
                        or subdir.startswith(".")):
             return "子文件夹名不能包含 / 且不能以 . 开头"
+        cleanup = item.get("cleanup")
+        if isinstance(cleanup, str):
+            cleanup = [part for part in cleanup.split(",") if part.strip()]
+        for entry in cleanup or []:
+            text = str(entry).strip()
+            if not text:
+                continue
+            if "/" in text or "\\" in text:
+                return "旧版本清理模板不能包含 /（例如 runtime-mpv-*-arm64-v8a.apk）"
     raw_days = data.get("check_interval_days")
     if raw_days is None:
         raw_days = data.get("check_interval_seconds")
@@ -966,12 +995,17 @@ def clean_config_payload(cfg, data):
         if isinstance(patterns, str):
             patterns = [part.strip() for part in patterns.split(",")]
         patterns = [str(part).strip() for part in (patterns or []) if str(part).strip()]
+        cleanup = item.get("cleanup")
+        if isinstance(cleanup, str):
+            cleanup = [part.strip() for part in cleanup.split(",")]
+        cleanup = [str(part).strip() for part in (cleanup or []) if str(part).strip()]
         cleaned["targets"].append({
             "repo": str(item.get("repo") or "").strip().strip("/"),
             "tag": str(item.get("tag") or "").strip(),
             "patterns": patterns or ["*.apk"],
             "archive": bool(item.get("archive", True)),
             "subdir": str(item.get("subdir") or "").strip(),
+            "cleanup": cleanup,
         })
     return cleaned
 
