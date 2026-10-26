@@ -121,6 +121,25 @@ def parse_prefixes(text):
     return result
 
 
+def parse_hour(value):
+    text = str(value if value is not None else "").strip()
+    if text == "":
+        return None
+    try:
+        hour = int(text)
+    except (TypeError, ValueError):
+        return None
+    return hour if 0 <= hour <= 23 else None
+
+
+_SKELETON_RE = re.compile(
+    r"v?\d+(?:\.\d+)+(?![A-Za-z0-9])|(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])")
+
+
+def name_skeleton(name):
+    return _SKELETON_RE.sub("#", str(name or "").lower())
+
+
 class ReleaseTarget:
     def __init__(self, repo, tag, patterns, archive, subdir=None):
         self.repo = repo or ""
@@ -181,9 +200,11 @@ class Config:
             stable = None
         self.stable_name = stable
         self.keep_versions = env_int("KEEP_VERSIONS", 1)
-        self.interval = max(0, env_int("CHECK_INTERVAL_SECONDS", 86400))
-        if 0 < self.interval < 30:
-            self.interval = 30
+        self.interval_days = env_int("CHECK_INTERVAL_DAYS", -1)
+        if self.interval_days < 0:
+            seconds = max(0, env_int("CHECK_INTERVAL_SECONDS", 86400))
+            self.interval_days = 0 if seconds <= 0 else max(1, int(round(seconds / 86400.0)))
+        self.check_hour = parse_hour(env("CHECK_HOUR"))
         self.run_on_start = env_bool("RUN_ON_START", True)
         self.run_once = env_bool("RUN_ONCE", False)
         self.timeout = env_int("REQUEST_TIMEOUT", 30)
@@ -205,12 +226,19 @@ class Config:
             self.repo = new_repo
         if data.get("download_dir"):
             self.download_dir = str(data["download_dir"]).strip()
-        if data.get("check_interval_seconds") is not None:
+        if data.get("check_interval_days") is not None:
             try:
-                value = max(0, int(data["check_interval_seconds"]))
-                self.interval = value if value == 0 else max(value, 30)
+                self.interval_days = max(0, int(data["check_interval_days"]))
             except (TypeError, ValueError):
                 pass
+        elif data.get("check_interval_seconds") is not None:
+            try:
+                seconds = max(0, int(data["check_interval_seconds"]))
+                self.interval_days = 0 if seconds <= 0 else max(1, int(round(seconds / 86400.0)))
+            except (TypeError, ValueError):
+                pass
+        if "check_hour" in data:
+            self.check_hour = parse_hour(data.get("check_hour"))
         if data.get("keep_versions") is not None:
             try:
                 self.keep_versions = max(int(data["keep_versions"]), 0)
@@ -251,7 +279,8 @@ class Config:
         return {
             "repo": self.repo,
             "download_dir": self.download_dir,
-            "check_interval_seconds": self.interval,
+            "check_interval_days": self.interval_days,
+            "check_hour": "" if self.check_hour is None else self.check_hour,
             "keep_versions": self.keep_versions,
             "stable_name": "auto" if self.stable_name is None else self.stable_name,
             "proxy_prefix": ",".join(prefix.rstrip("/") for prefix in self.proxy_prefixes),
@@ -265,6 +294,14 @@ class Config:
 
     def target_subdir(self, target):
         return target.effective_subdir()
+
+    def schedule_desc(self):
+        if self.interval_days <= 0:
+            return "手动"
+        desc = "每%d天" % self.interval_days
+        if self.check_hour is not None:
+            desc += " %02d:00" % self.check_hour
+        return desc
 
     def target_dir(self, target):
         subdir = target.effective_subdir()
@@ -443,9 +480,11 @@ def plan_release(cfg, state, target):
                                "url": asset.get("browser_download_url")}})
     if not items:
         return {"action": "none", "tag": tag,
+                "asset_names": [asset["name"] for asset in matched],
                 "reason": "[%s] current: %s %s (%s)"
                 % (target.label, repo, tag, ", ".join(current))}
     return {"action": "download", "items": items,
+            "asset_names": [asset["name"] for asset in matched],
             "description": "[%s] %s tag %s -> %s" % (target.label, repo, tag,
                                                      ", ".join(item["asset_name"] for item in items)),
             "tag": tag, "release_url": release.get("html_url")}
@@ -627,6 +666,41 @@ def cleanup_target_versioned(cfg, state, target):
     return removed
 
 
+def cleanup_stale_names(cfg, state, target, repo, current_names):
+    current = set(current_names)
+    skeletons = {name_skeleton(name) for name in current_names}
+    if not skeletons:
+        return []
+    assets_state = state.get("assets") or {}
+    work_dir = cfg.target_dir(target)
+    removed = []
+    for key, entry in list(assets_state.items()):
+        if key.startswith("raw:"):
+            continue
+        name = key.rsplit(":", 1)[-1] if ":" in key else key
+        if name in current:
+            continue
+        if is_new_state_key(key) and key.split(":", 1)[0] != repo:
+            continue
+        if not any(fnmatch.fnmatch(name.lower(), pattern.lower())
+                   for pattern in target.patterns):
+            continue
+        if name_skeleton(name) not in skeletons:
+            continue
+        for file_name in {entry.get("file"), name}:
+            if not file_name or file_name in current:
+                continue
+            path = os.path.join(work_dir, file_name)
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    removed.append(file_name)
+                except OSError:
+                    pass
+        assets_state.pop(key, None)
+    return removed
+
+
 def fetch_item(cfg, item, part):
     last_error = None
     for url in item.get("urls") or []:
@@ -779,11 +853,16 @@ def check_once(cfg, state):
                     if removed:
                         log("removed old versions: %s" % ", ".join(removed))
                 log("no update: %s" % plan.get("reason"))
-                continue
-            log("update found: %s" % plan.get("description"))
-            apply_download(cfg, state, plan)
-            if plan.get("release_url"):
-                state["release_url"] = plan["release_url"]
+            else:
+                log("update found: %s" % plan.get("description"))
+                apply_download(cfg, state, plan)
+                if plan.get("release_url"):
+                    state["release_url"] = plan["release_url"]
+            if target is not None and plan.get("asset_names"):
+                removed = cleanup_stale_names(cfg, state, target, target.repo or cfg.repo,
+                                              plan["asset_names"])
+                if removed:
+                    log("removed old versions (renamed): %s" % ", ".join(removed))
         except Exception as error:
             errors.append("%s: %s: %s" % (label, type(error).__name__, error))
     if errors:
@@ -828,27 +907,51 @@ def validate_config_update(cfg, data):
         if subdir and ("/" in subdir or "\\" in subdir or subdir in (".", "..")
                        or subdir.startswith(".")):
             return "子文件夹名不能包含 / 且不能以 . 开头"
-    raw_interval = data.get("check_interval_seconds")
-    if raw_interval is None:
-        raw_interval = cfg.interval
+    raw_days = data.get("check_interval_days")
+    if raw_days is None:
+        raw_days = data.get("check_interval_seconds")
+        if raw_days is not None:
+            try:
+                seconds = max(0, int(raw_days))
+                raw_days = 0 if seconds <= 0 else max(1, int(round(seconds / 86400.0)))
+            except (TypeError, ValueError):
+                return "检查间隔必须是数字"
+    if raw_days is None:
+        raw_days = cfg.interval_days
     try:
-        interval = int(raw_interval)
+        days = int(raw_days)
     except (TypeError, ValueError):
-        return "检查间隔必须是数字"
-    if interval < 0:
-        return "检查间隔不能为负数（0 = 不自动检查）"
-    if 0 < interval < 30:
-        return "检查间隔至少 30 秒（0 = 不自动检查）"
+        return "检查间隔(天)必须是整数"
+    if days < 0:
+        return "检查间隔(天)不能为负数（0 = 不自动检查）"
+    raw_hour = data.get("check_hour")
+    if raw_hour not in (None, ""):
+        try:
+            hour = int(raw_hour)
+        except (TypeError, ValueError):
+            return "更新时间需为 0-23 的整数（留空 = 不指定）"
+        if not 0 <= hour <= 23:
+            return "更新时间需为 0-23 的整数（留空 = 不指定）"
     return ""
 
 
 def clean_config_payload(cfg, data):
+    raw_days = data.get("check_interval_days")
+    if raw_days is None:
+        raw_days = data.get("check_interval_seconds")
+        if raw_days is not None:
+            seconds = max(0, int(raw_days))
+            raw_days = 0 if seconds <= 0 else max(1, int(round(seconds / 86400.0)))
+    days = cfg.interval_days if raw_days is None else max(0, int(raw_days))
+    if "check_hour" in data:
+        hour = parse_hour(data.get("check_hour"))
+    else:
+        hour = cfg.check_hour
     cleaned = {
         "repo": str(data.get("repo") or cfg.repo).strip().strip("/"),
         "download_dir": str(data.get("download_dir") or cfg.download_dir).strip().rstrip("/") or "/",
-        "check_interval_seconds": int(data.get("check_interval_seconds")
-                                      if data.get("check_interval_seconds") is not None
-                                      else cfg.interval),
+        "check_interval_days": days,
+        "check_hour": "" if hour is None else hour,
         "keep_versions": int(data.get("keep_versions") if data.get("keep_versions") is not None
                              else cfg.keep_versions),
         "stable_name": str(data.get("stable_name") if data.get("stable_name") is not None else "auto"),
@@ -932,6 +1035,7 @@ class Updater:
         self.lock = threading.RLock()
         self.trigger = threading.Event()
         self.stop = threading.Event()
+        self.next_deadline = None
         self.config_path = env("CONFIG_FILE", "/data/config.json")
         self.state_path = env("STATE_FILE", "/data/state.json")
         data = self.load_config()
@@ -956,13 +1060,13 @@ class Updater:
             cleaned = clean_config_payload(self.cfg, payload)
             save_json(self.config_path, cleaned)
             self.cfg = Config(cleaned)
-        log("config updated via panel (dir=%s, targets=%d, interval=%ss)"
-            % (self.cfg.download_dir, len(self.cfg.targets), self.cfg.interval))
+        log("config updated via panel (dir=%s, targets=%d, schedule=%s)"
+            % (self.cfg.download_dir, len(self.cfg.targets), self.cfg.schedule_desc()))
         try:
             os.makedirs(self.cfg.download_dir, exist_ok=True)
         except OSError as error:
             log("warning: cannot create %s: %s" % (self.cfg.download_dir, error))
-        if self.cfg.interval > 0:
+        if self.cfg.interval_days > 0:
             self.trigger.set()
         return self.cfg
 
@@ -974,12 +1078,13 @@ class Updater:
         first = True
         while not self.stop.is_set():
             cfg, _ = self.snapshot()
-            skip_first = first and not cfg.run_once and (cfg.interval <= 0 or not cfg.run_on_start)
+            skip_first = first and not cfg.run_once \
+                and (cfg.interval_days <= 0 or not cfg.run_on_start)
             if first and not cfg.run_once:
-                if cfg.interval <= 0:
-                    log("自动检查已关闭（检查间隔=0），仅手动检查生效")
+                if cfg.interval_days <= 0:
+                    log("自动检查已关闭（检查间隔=0天），仅手动检查生效")
                 elif not cfg.run_on_start:
-                    log("RUN_ON_START=0, waiting %ss before first check" % cfg.interval)
+                    log("RUN_ON_START=0, waiting for next scheduled check (%s)" % cfg.schedule_desc())
             if not skip_first:
                 local_state = self.snapshot()[1]
                 try:
@@ -996,16 +1101,32 @@ class Updater:
                     self.stop.set()
                     return
             first = False
-            self.wait_next(cfg.interval)
+            deadline = self.next_check_time(cfg)
+            with self.lock:
+                self.next_deadline = deadline
+            self.wait_next(deadline)
 
-    def wait_next(self, interval):
-        if interval <= 0:
+    def next_check_time(self, cfg, base=None):
+        if cfg.interval_days <= 0:
+            return None
+        base = time.time() if base is None else base
+        step = cfg.interval_days * 86400
+        if cfg.check_hour is None:
+            return base + step
+        local = time.localtime(base)
+        target = time.mktime((local.tm_year, local.tm_mon, local.tm_mday,
+                              cfg.check_hour, 0, 0, 0, 0, -1))
+        while target <= base + 1:
+            target += step
+        return target
+
+    def wait_next(self, deadline):
+        if deadline is None:
             while not self.stop.is_set():
                 if self.trigger.wait(timeout=1):
                     self.trigger.clear()
                     return
             return
-        deadline = time.time() + interval
         while not self.stop.is_set():
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -1042,15 +1163,19 @@ class Updater:
             main_tag = tags.get("release:%s" % cfg.targets[0].label)
         if not main_tag:
             main_tag = state.get("tag")
+        if cfg.interval_days > 0:
+            deadline = getattr(self, "next_deadline", None) or self.next_check_time(cfg)
+            next_seconds = max(0, int(deadline - time.time()))
+        else:
+            next_seconds = None
         result = {
             "ok": True,
             "mode": cfg.mode,
             "config": cfg.to_config_dict(),
             "target_desc": cfg.target_desc(),
             "last_check_iso": state.get("last_check_iso"),
-            "next_check_seconds": (max(0, int(last + cfg.interval - time.time())) if last else None)
-                                  if cfg.interval > 0 else None,
-            "auto_check_enabled": cfg.interval > 0,
+            "next_check_seconds": next_seconds,
+            "auto_check_enabled": cfg.interval_days > 0,
             "tag": main_tag,
             "tags": tags,
             "assets": state.get("assets") or {},
@@ -1063,8 +1188,9 @@ class Updater:
     def health(self):
         cfg, state = self.snapshot()
         last = float(state.get("last_check_ts") or 0)
-        if last and cfg.interval > 0:
-            healthy = (time.time() - last) <= max(2 * cfg.interval, 1800)
+        if last and cfg.interval_days > 0:
+            window = max(2 * cfg.interval_days * 86400, 3600)
+            healthy = (time.time() - last) <= window
         else:
             healthy = True
         return healthy, {"ok": True, "healthy": healthy, "last_check_ts": last}
@@ -1192,8 +1318,8 @@ def main():
     handler.updater = updater
     server = ThreadingHTTPServer(("0.0.0.0", port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    log("apk-updater start | mode=%s dir=%s interval=%ss keep=%d" % (
-        updater.cfg.mode, updater.cfg.download_dir, updater.cfg.interval,
+    log("apk-updater start | mode=%s dir=%s schedule=%s keep=%d" % (
+        updater.cfg.mode, updater.cfg.download_dir, updater.cfg.schedule_desc(),
         updater.cfg.keep_versions))
     log("target: %s" % updater.cfg.target_desc())
     log("panel: http://<nas-ip>:%d/ | token %s"
