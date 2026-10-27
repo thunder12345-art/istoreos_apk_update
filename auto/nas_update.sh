@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 
 BUNDLE="${1:-/mnt/sata1-2/docker/apk-updater.bundle}"
 TS="$(date +%Y%m%d-%H%M%S)"
+export GIT_TERMINAL_PROMPT=0
 
 compose() {
     if docker compose version >/dev/null 2>&1; then
@@ -60,6 +61,11 @@ case "$REMOTE_URL" in
     *)
         git push origin main || echo "   !! push failed (check credentials), local commit is safe" ;;
 esac
+if git remote get-url gitee >/dev/null 2>&1; then
+    git push gitee main || echo "   !! gitee push failed (check credentials/remote), local commit is safe"
+else
+    echo "   (gitee remote not set; enable once: git remote add gitee https://gitee.com/<user>/<repo>.git)"
+fi
 
 echo "== [5/6] rebuild image =="
 compose build
