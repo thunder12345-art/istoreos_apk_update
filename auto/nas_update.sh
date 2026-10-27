@@ -15,6 +15,21 @@ compose() {
     fi
 }
 
+push_with_retry() {
+    remote="$1"
+    ref="$2"
+    attempt=1
+    while [ "$attempt" -le 3 ]; do
+        if git -c http.version=HTTP/1.1 push "$remote" "$ref"; then
+            return 0
+        fi
+        echo "   !! $remote $ref push failed (attempt $attempt/3), retrying in 3s..."
+        attempt=$((attempt + 1))
+        sleep 3
+    done
+    return 1
+}
+
 echo "== [0/6] ensure git identity =="
 git config user.email >/dev/null 2>&1 || git config user.email "nas@local"
 git config user.name >/dev/null 2>&1 || git config user.name "iStoreOS NAS"
@@ -59,10 +74,10 @@ case "$REMOTE_URL" in
     ""|*".bundle")
         echo "   (origin not set; enable once: git remote add origin git@github.com:thunder12345-art/istoreos_apk_update.git)" ;;
     *)
-        git push origin main || echo "   !! push failed (check credentials), local commit is safe" ;;
+        push_with_retry origin main || echo "   !! push failed (check credentials/network), local commit is safe" ;;
 esac
 if git remote get-url gitee >/dev/null 2>&1; then
-    git push gitee main || echo "   !! gitee push failed (check credentials/remote), local commit is safe"
+    push_with_retry gitee main || echo "   !! gitee push failed (check credentials/remote), local commit is safe"
 else
     echo "   (gitee not set; enable once: git remote add gitee https://gitee.com/thunder0629/istoreos_apk_update.git)"
 fi

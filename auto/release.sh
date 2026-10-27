@@ -21,6 +21,21 @@ remote_slug() {
     printf '%s' "$url" | sed 's/\.git$//' | sed 's#^.*[:/]\([^/:]*/[^/]*\)$#\1#'
 }
 
+push_with_retry() {
+    remote="$1"
+    ref="$2"
+    attempt=1
+    while [ "$attempt" -le 3 ]; do
+        if git -c http.version=HTTP/1.1 push "$remote" "$ref"; then
+            return 0
+        fi
+        echo "   !! $remote $ref push failed (attempt $attempt/3), retrying in 3s..."
+        attempt=$((attempt + 1))
+        sleep 3
+    done
+    return 1
+}
+
 if [ -f .env ]; then
     GITHUB_TOKEN="${GITHUB_TOKEN:-$(env_val GITHUB_TOKEN)}"
     GITEE_TOKEN="${GITEE_TOKEN:-$(env_val GITEE_TOKEN)}"
@@ -45,11 +60,19 @@ if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
     git tag "$TAG"
     echo "   created local tag $TAG"
 fi
-git push origin main || echo "   !! origin push failed (check credentials), continuing"
-git push origin "$TAG" || echo "   !! origin tag push failed, continuing"
+push_with_retry origin main || echo "   !! origin push failed (check credentials/network), continuing"
+if git ls-remote --tags origin "refs/tags/$TAG" 2>/dev/null | grep -q .; then
+    echo "   (origin tag $TAG already exists, skip)"
+else
+    push_with_retry origin "$TAG" || echo "   !! origin tag push failed, continuing"
+fi
 if git remote get-url gitee >/dev/null 2>&1; then
-    git push gitee main || echo "   !! gitee push failed (check credentials/remote), continuing"
-    git push gitee "$TAG" || echo "   !! gitee tag push failed, continuing"
+    push_with_retry gitee main || echo "   !! gitee push failed (check credentials/remote), continuing"
+    if git ls-remote --tags gitee "refs/tags/$TAG" 2>/dev/null | grep -q .; then
+        echo "   (gitee tag $TAG already exists, skip)"
+    else
+        push_with_retry gitee "$TAG" || echo "   !! gitee tag push failed, continuing"
+    fi
 else
     echo "   (gitee not set; enable once: git remote add gitee https://gitee.com/thunder0629/istoreos_apk_update.git)"
 fi
