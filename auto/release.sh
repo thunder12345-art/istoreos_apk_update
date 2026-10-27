@@ -69,7 +69,7 @@ tar -czf "$INSTALL_PKG" README.md docker-compose.yml .env.example auto/nas_updat
 ls -lh "$INSTALL_PKG"
 
 echo "== [4/5] upload to github + gitee releases =="
-set -- --tag "$TAG" --dir "$DIST"
+set -- --tag "$TAG" --dir "dist"
 if [ -n "$GITHUB_SLUG" ]; then set -- "$@" --github "$GITHUB_SLUG"; fi
 if [ -n "$GITEE_SLUG" ]; then set -- "$@" --gitee "$GITEE_SLUG"; fi
 run_py auto/release.py "$@" || echo "   !! release upload had errors (check tokens: GITHUB_TOKEN / GITEE_TOKEN in .env)"

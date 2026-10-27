@@ -76,7 +76,8 @@ def request_json(method, url, headers=None, data=None, ok=(200,)):
     status, payload = request(method, url, headers, data, ok=ok)
     if not payload:
         return status, {}
-    return status, json.loads(payload.decode("utf-8", "replace"))
+    parsed = json.loads(payload.decode("utf-8", "replace"))
+    return status, parsed if isinstance(parsed, dict) else {}
 
 
 def build_multipart(fields, file_field, filename, content):
@@ -133,19 +134,19 @@ def upload_gitee(slug, tag, body, token, paths):
     status, release = request_json(
         "GET", "%s/releases/tags/%s?access_token=%s"
         % (base, urllib.parse.quote(tag), urllib.parse.quote(token)), ok=(200, 404))
-    if status == 404:
+    if not release.get("id"):
         fields = {"access_token": token, "tag_name": tag, "name": tag, "body": body,
                   "target_commitish": "main"}
         data = urllib.parse.urlencode(fields).encode("utf-8")
         _, release = request_json("POST", base + "/releases",
                                   {"Content-Type": "application/x-www-form-urlencoded"},
                                   data, ok=(200, 201))
+        if not release.get("id"):
+            raise RuntimeError("gitee create release failed: %s" % str(release)[:300])
         log("  gitee: created release %s" % tag)
     else:
         log("  gitee: using existing release %s" % tag)
-    release_id = release.get("id")
-    if not release_id:
-        raise RuntimeError("gitee release response missing id: %s" % str(release)[:200])
+    release_id = release["id"]
     for path in paths:
         name = os.path.basename(path)
         with open(path, "rb") as handle:
