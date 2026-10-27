@@ -13,11 +13,22 @@ env_val() {
     sed -n "s/^$1=//p" ./.env 2>/dev/null | tail -n 1 | tr -d '\r' | sed 's/^"//; s/"$//'
 }
 
+remote_slug() {
+    url="$(git remote get-url "$1" 2>/dev/null || true)"
+    case "$url" in
+        ""|*".bundle") return 1 ;;
+    esac
+    printf '%s' "$url" | sed 's/\.git$//' | sed 's#^.*[:/]\([^/:]*/[^/]*\)$#\1#'
+}
+
 if [ -f .env ]; then
     GITHUB_TOKEN="${GITHUB_TOKEN:-$(env_val GITHUB_TOKEN)}"
     GITEE_TOKEN="${GITEE_TOKEN:-$(env_val GITEE_TOKEN)}"
     export GITHUB_TOKEN GITEE_TOKEN
 fi
+
+GITHUB_SLUG="$(remote_slug origin || true)"
+GITEE_SLUG="$(remote_slug gitee || true)"
 
 run_py() {
     if command -v "$PY" >/dev/null 2>&1; then
@@ -29,12 +40,18 @@ run_py() {
     fi
 }
 
-echo "== [0/5] push code to origin + gitee =="
+echo "== [0/5] push code + tag to origin + gitee =="
+if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+    git tag "$TAG"
+    echo "   created local tag $TAG"
+fi
 git push origin main || echo "   !! origin push failed (check credentials), continuing"
+git push origin "$TAG" || echo "   !! origin tag push failed, continuing"
 if git remote get-url gitee >/dev/null 2>&1; then
     git push gitee main || echo "   !! gitee push failed (check credentials/remote), continuing"
+    git push gitee "$TAG" || echo "   !! gitee tag push failed, continuing"
 else
-    echo "   (gitee remote not set; enable once: git remote add gitee https://gitee.com/<user>/<repo>.git)"
+    echo "   (gitee not set; enable once: git remote add gitee https://gitee.com/thunder0629/istoreos_apk_update.git)"
 fi
 
 echo "== [1/5] build image ${IMAGE}:${TAG} =="
@@ -52,7 +69,10 @@ tar -czf "$INSTALL_PKG" README.md docker-compose.yml .env.example auto/nas_updat
 ls -lh "$INSTALL_PKG"
 
 echo "== [4/5] upload to github + gitee releases =="
-run_py auto/release.py --tag "$TAG" --dir "$DIST" || echo "   !! release upload had errors (check tokens: GITHUB_TOKEN / GITEE_TOKEN in .env)"
+set -- --tag "$TAG" --dir "$DIST"
+if [ -n "$GITHUB_SLUG" ]; then set -- "$@" --github "$GITHUB_SLUG"; fi
+if [ -n "$GITEE_SLUG" ]; then set -- "$@" --gitee "$GITEE_SLUG"; fi
+run_py auto/release.py "$@" || echo "   !! release upload had errors (check tokens: GITHUB_TOKEN / GITEE_TOKEN in .env)"
 
 echo ""
 echo "done. tag:    $TAG"
