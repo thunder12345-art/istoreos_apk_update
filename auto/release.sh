@@ -9,10 +9,14 @@ DIST="$PWD/dist"
 PY="${PYTHON:-python3}"
 export GIT_TERMINAL_PROMPT=0
 
+env_val() {
+    sed -n "s/^$1=//p" ./.env 2>/dev/null | tail -n 1 | tr -d '\r' | sed 's/^"//; s/"$//'
+}
+
 if [ -f .env ]; then
-    set -a
-    . ./.env
-    set +a
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(env_val GITHUB_TOKEN)}"
+    GITEE_TOKEN="${GITEE_TOKEN:-$(env_val GITEE_TOKEN)}"
+    export GITHUB_TOKEN GITEE_TOKEN
 fi
 
 run_py() {
@@ -20,7 +24,8 @@ run_py() {
         "$PY" "$@"
     else
         echo "   (host $PY not found, using container image: $IMAGE)"
-        docker run --rm -v "$PWD:/app" -w /app --entrypoint python "${IMAGE}:${TAG}" "$@"
+        docker run --rm -v "$PWD:/app" -w /app -e GITHUB_TOKEN -e GITEE_TOKEN \
+            --entrypoint python "${IMAGE}:${TAG}" "$@"
     fi
 }
 

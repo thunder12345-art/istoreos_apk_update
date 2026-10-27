@@ -57,14 +57,14 @@ fi
 REMOTE_URL="$(git remote get-url origin 2>/dev/null || true)"
 case "$REMOTE_URL" in
     ""|*".bundle")
-        echo "   (origin is local/none, skip push)" ;;
+        echo "   (origin not set; enable once: git remote add origin git@github.com:thunder12345-art/istoreos_apk_update.git)" ;;
     *)
         git push origin main || echo "   !! push failed (check credentials), local commit is safe" ;;
 esac
 if git remote get-url gitee >/dev/null 2>&1; then
     git push gitee main || echo "   !! gitee push failed (check credentials/remote), local commit is safe"
 else
-    echo "   (gitee remote not set; enable once: git remote add gitee https://gitee.com/<user>/<repo>.git)"
+    echo "   (gitee not set; enable once: git remote add gitee https://gitee.com/thunder0629/istoreos_apk_update.git)"
 fi
 
 echo "== [5/6] rebuild image =="
