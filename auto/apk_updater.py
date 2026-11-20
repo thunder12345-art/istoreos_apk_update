@@ -275,7 +275,9 @@ class Config:
         if "proxy_prefix" in data:
             self.proxy_prefixes = parse_prefixes(data.get("proxy_prefix"))
         if "github_token" in data:
-            self.token = str(data.get("github_token") or "").strip()
+            value = str(data.get("github_token") or "").strip()
+            if value:
+                self.token = value
         if "include_prerelease" in data:
             self.include_prerelease = bool(data.get("include_prerelease"))
         if isinstance(data.get("targets"), list) and data["targets"]:
