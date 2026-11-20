@@ -92,7 +92,8 @@ docker compose up -d --build
 | `KEEP_VERSIONS` | 保留版本数 | 版本化保存时保留的新旧份数 |
 | `CHECK_INTERVAL_DAYS` | 检查间隔（天） | `0` = 不自动检查 |
 | `CHECK_HOUR` | 更新时间 | `0-23`，如 `10` = 每天 10 点；留空 = 从上次检查起算间隔 |
-| `GITHUB_TOKEN` | GitHub 令牌 | 可选：提升 API 限额/私有仓库 |
+| `GITHUB_TOKEN` | GitHub 令牌 | 可选：提升 API 限额/私有仓库；面板中已设置时显示 `***` |
+| `ALLOW_INSECURE` | - | `0`（默认）= 校验 TLS 证书；`1` = 关闭校验（仅当代理证书异常时使用） |
 | `MODE` / `RAW_*` | - | raw 模式（监控单个文件），一般不用 |
 
 `EXTRA_TARGETS` 格式（分号分隔多个目标）：
@@ -128,5 +129,7 @@ docker compose up -d --build
 - **面板打不开**：`docker compose ps` 看容器状态，`docker logs --tail 30 apk-updater` 看日志
 - **取到旧版本**：本工具对 `latest` 采用按发布时间排序（GitHub `/releases/latest` 对部分仓库不可靠，已规避）
 - **磁盘空间不足（ENOSPC）**：确认 `NAS_ROOT` 指向真实挂载点（如 `/mnt/data_sda1`），`/mnt/sata1-1` 之类可能是 tmpfs 占位，并未挂载
-- **下载慢/失败**：设置 `PROXY_PREFIX=https://gh-proxy.com/`（多个代理可逗号分隔，自动回退）
+- **下载慢/失败**：设置 `PROXY_PREFIX=https://gh-proxy.com/`（多个代理可逗号分隔，自动回退；请求会自动重试 2~3 次）
+- **HTTPS 证书报错**：个别代理证书异常时，`.env` 设 `ALLOW_INSECURE=1` 可关闭 TLS 校验（默认开启校验，防中间人替换 APK）
+- **磁盘空间**：下载前会检查目标目录剩余空间，不足时跳过并在日志中提示（至少预留 64MB + 文件大小）
 - **数据文件**：容器 `./data/config.json`（面板配置，首次由 .env 生成后以此为准）、`./data/state.json`（下载状态）、`./data/updater.log`（日志）

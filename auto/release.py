@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -80,6 +81,22 @@ def request_json(method, url, headers=None, data=None, ok=(200,)):
     return status, parsed if isinstance(parsed, dict) else {}
 
 
+def upload_with_retry(fn, name, attempts=3, delay=5):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as error:
+            last_error = error
+            if " -> HTTP 4" in str(error) or attempt >= attempts:
+                break
+            log("  upload %s attempt %d/%d failed: %s; retrying in %ds"
+                % (name, attempt, attempts, error, delay))
+            time.sleep(delay)
+            delay *= 2
+    raise last_error
+
+
 def build_multipart(fields, file_field, filename, content):
     boundary = "----apkupd" + uuid.uuid4().hex
     parts = []
@@ -125,7 +142,8 @@ def upload_github(slug, tag, body, token, paths):
                % (slug, release_id, urllib.parse.quote(name)))
         upload_headers = dict(headers)
         upload_headers["Content-Type"] = "application/octet-stream"
-        request("POST", url, upload_headers, data, timeout=3600, ok=(201,))
+        upload_with_retry(lambda: request("POST", url, upload_headers, data,
+                                          timeout=3600, ok=(201,)), name)
     return "https://github.com/%s/releases/tag/%s" % (slug, tag)
 
 
@@ -155,7 +173,8 @@ def upload_gitee(slug, tag, body, token, paths):
         data, ctype = build_multipart({"access_token": token}, "file", name, content)
         url = "%s/releases/%s/attach_files" % (base, release_id)
         try:
-            request("POST", url, {"Content-Type": ctype}, data, timeout=3600, ok=(200, 201))
+            upload_with_retry(lambda: request("POST", url, {"Content-Type": ctype}, data,
+                                              timeout=3600, ok=(200, 201)), name)
         except RuntimeError as error:
             log("  gitee: upload failed (可能已存在同名附件，可先在页面上删除): %s" % error)
     return "https://gitee.com/%s/releases/tag/%s" % (slug, tag)

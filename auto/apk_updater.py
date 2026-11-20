@@ -22,10 +22,6 @@ CHUNK = 256 * 1024
 BASE = os.path.dirname(os.path.abspath(__file__))
 PANEL_FILE = os.path.join(BASE, "panel.html")
 
-SSL_CTX = ssl.create_default_context()
-SSL_CTX.check_hostname = False
-SSL_CTX.verify_mode = ssl.CERT_NONE
-
 LOG_LINES = deque(maxlen=400)
 
 
@@ -61,6 +57,28 @@ def env_bool(name, default=False):
     if raw in ("0", "false", "no", "off"):
         return False
     return default
+
+
+SSL_CTX = ssl.create_default_context()
+if env_bool("ALLOW_INSECURE", False):
+    SSL_CTX.check_hostname = False
+    SSL_CTX.verify_mode = ssl.CERT_NONE
+
+
+def retry_call(fn, attempts=3, delay=2.0, label="request"):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as error:
+            last_error = error
+            if not getattr(error, "retryable", True) or attempt >= attempts:
+                break
+            log("%s failed (attempt %d/%d): %s: %s; retrying in %.0fs"
+                % (label, attempt, attempts, type(error).__name__, error, delay))
+            time.sleep(delay)
+            delay *= 2
+    raise last_error
 
 
 def now_iso():
@@ -380,20 +398,26 @@ def github_headers(cfg):
 
 def api_get_json(cfg, path):
     url = cfg.api_base + path
-    try:
-        with http_open(url, headers=github_headers(cfg), timeout=cfg.timeout) as response:
-            payload = response.read()
-    except urllib.error.HTTPError as error:
-        detail = ""
+
+    def attempt():
         try:
-            detail = error.read(300).decode("utf-8", "replace")
-        except Exception:
-            pass
-        hint = ""
-        if error.code == 403 and "rate limit" in detail.lower():
-            hint = " (rate limited, set GITHUB_TOKEN)"
-        raise RuntimeError("github api HTTP %s for %s%s %s" % (error.code, path, hint, detail))
-    return json.loads(payload.decode("utf-8", "replace"))
+            with http_open(url, headers=github_headers(cfg), timeout=cfg.timeout) as response:
+                return json.loads(response.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as error:
+            detail = ""
+            try:
+                detail = error.read(300).decode("utf-8", "replace")
+            except Exception:
+                pass
+            hint = ""
+            if error.code == 403 and "rate limit" in detail.lower():
+                hint = " (rate limited, set GITHUB_TOKEN)"
+            failure = RuntimeError("github api HTTP %s for %s%s %s"
+                                   % (error.code, path, hint, detail))
+            failure.retryable = error.code >= 500 or error.code == 429
+            raise failure
+
+    return retry_call(attempt, label="github api %s" % path)
 
 
 def fetch_release(cfg, repo, tag=None):
@@ -515,10 +539,12 @@ def probe_url(cfg, url):
     candidates = url_candidates(url, cfg.proxy_prefixes)
     for candidate in candidates:
         try:
-            with http_open(candidate, headers=headers, timeout=cfg.timeout) as response:
-                meta = {"etag": response.headers.get("ETag"),
-                        "last_modified": response.headers.get("Last-Modified"),
-                        "length": response.headers.get("Content-Length")}
+            def attempt(candidate=candidate):
+                with http_open(candidate, headers=headers, timeout=cfg.timeout) as response:
+                    return {"etag": response.headers.get("ETag"),
+                            "last_modified": response.headers.get("Last-Modified"),
+                            "length": response.headers.get("Content-Length")}
+            meta = retry_call(attempt, attempts=2, label="probe %s" % candidate)
             rotated = [candidate] + [item for item in candidates if item != candidate]
             return meta, rotated
         except Exception as error:
@@ -725,9 +751,11 @@ def fetch_item(cfg, item, part):
     last_error = None
     for url in item.get("urls") or []:
         try:
-            log("downloading %s" % url)
-            sha, size = download_once(cfg, url, part, item.get("expected_size"),
-                                      item.get("expected_digest"))
+            def attempt(url=url):
+                log("downloading %s" % url)
+                return download_once(cfg, url, part, item.get("expected_size"),
+                                     item.get("expected_digest"))
+            sha, size = retry_call(attempt, attempts=2, label="download")
             return sha, size, None
         except Exception as error:
             last_error = "%s: %s" % (type(error).__name__, error)
@@ -759,6 +787,22 @@ def files_present(cfg, item, previous):
     return True
 
 
+DISK_MARGIN = 64 * 1024 * 1024
+
+
+def free_bytes(path):
+    probe = path
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        return shutil.disk_usage(probe or "/").free
+    except OSError:
+        return None
+
+
 def apply_download(cfg, state, plan):
     assets_state = state.setdefault("assets", {})
     stable_warned = False
@@ -774,6 +818,12 @@ def apply_download(cfg, state, plan):
             os.makedirs(work_dir, exist_ok=True)
         except OSError as error:
             errors.append("%s: cannot create %s: %s" % (name, work_dir, error))
+            continue
+        free = free_bytes(work_dir)
+        need = (item.get("expected_size") or 0) + DISK_MARGIN
+        if free is not None and free < need:
+            errors.append("%s: not enough disk space in %s (free %.0f MB, need ~%.0f MB)"
+                          % (name, work_dir, free / 1048576.0, need / 1048576.0))
             continue
         ext = os.path.splitext(name)[1] or ".apk"
         stem = cfg.stem_for(name, matched_total)
@@ -976,6 +1026,13 @@ def clean_config_payload(cfg, data):
         hour = parse_hour(data.get("check_hour"))
     else:
         hour = cfg.check_hour
+    raw_token = data.get("github_token")
+    if raw_token is None:
+        token_text = cfg.token
+    else:
+        token_text = str(raw_token).strip()
+        if token_text == "***":
+            token_text = cfg.token
     cleaned = {
         "repo": str(data.get("repo") or cfg.repo).strip().strip("/"),
         "download_dir": str(data.get("download_dir") or cfg.download_dir).strip().rstrip("/") or "/",
@@ -985,7 +1042,7 @@ def clean_config_payload(cfg, data):
                              else cfg.keep_versions),
         "stable_name": str(data.get("stable_name") if data.get("stable_name") is not None else "auto"),
         "proxy_prefix": str(data.get("proxy_prefix") or "").strip(),
-        "github_token": str(data.get("github_token") or "").strip(),
+        "github_token": token_text,
         "include_prerelease": bool(data.get("include_prerelease")),
         "targets": [],
         "mode": cfg.mode,
@@ -1205,7 +1262,7 @@ class Updater:
         result = {
             "ok": True,
             "mode": cfg.mode,
-            "config": cfg.to_config_dict(),
+            "config": self.masked_config(cfg),
             "target_desc": cfg.target_desc(),
             "last_check_iso": state.get("last_check_iso"),
             "next_check_seconds": next_seconds,
@@ -1228,6 +1285,13 @@ class Updater:
         else:
             healthy = True
         return healthy, {"ok": True, "healthy": healthy, "last_check_ts": last}
+
+    @staticmethod
+    def masked_config(cfg):
+        config = cfg.to_config_dict()
+        if config.get("github_token"):
+            config["github_token"] = "***"
+        return config
 
 
 PANEL_TOKEN = env("PANEL_TOKEN")
@@ -1313,7 +1377,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             except ValueError as error:
                 self.send_json({"error": str(error)}, 400)
                 return
-            self.send_json({"ok": True, "config": cfg.to_config_dict()})
+            self.send_json({"ok": True, "config": self.updater.masked_config(cfg)})
             return
         if path == "/api/check":
             self.updater.trigger.set()
@@ -1358,6 +1422,8 @@ def main():
     log("target: %s" % updater.cfg.target_desc())
     log("panel: http://<nas-ip>:%d/ | token %s"
         % (port, "enabled" if PANEL_TOKEN else "disabled"))
+    if env_bool("ALLOW_INSECURE", False):
+        log("warning: ALLOW_INSECURE=1, TLS certificate verification disabled")
     if updater.cfg.token:
         log("github token: configured")
     if updater.cfg.proxy_prefixes:
