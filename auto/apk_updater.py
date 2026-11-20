@@ -159,13 +159,14 @@ def name_skeleton(name):
 
 
 class ReleaseTarget:
-    def __init__(self, repo, tag, patterns, archive, subdir=None, cleanup=None):
+    def __init__(self, repo, tag, patterns, archive, subdir=None, cleanup=None, protect=None):
         self.repo = repo or ""
         self.tag = tag
         self.patterns = patterns
         self.archive = archive
         self.subdir = subdir or ""
         self.cleanup = [item for item in (cleanup or []) if item]
+        self.protect = [item for item in (protect or []) if item]
         self.label = "%s:%s" % (self.repo or "?", tag or "latest")
 
     def effective_subdir(self):
@@ -190,14 +191,19 @@ class Config:
         self.asset_patterns = [item.strip() for item in patterns.split(",") if item.strip()] or ["*.apk"]
         self.release_tag = env("RELEASE_TAG")
         self.include_prerelease = env_bool("INCLUDE_PRERELEASE", False)
-        self.targets = [ReleaseTarget(self.repo, self.release_tag or None, self.asset_patterns, True)]
+        protect_env = [item.strip() for item in env("PROTECT_PATTERNS").split(",") if item.strip()]
+        self.targets = [ReleaseTarget(self.repo, self.release_tag or None, self.asset_patterns,
+                                      True, None, None, protect_env)]
         for spec in env("EXTRA_TARGETS").split(";"):
             spec = spec.strip()
             if not spec:
                 continue
             parts = [part.strip() for part in spec.split("|")]
             cleanup_text = ""
-            if len(parts) >= 5:
+            protect_text = ""
+            if len(parts) >= 6:
+                repo, tag, pattern_text, archive_text, cleanup_text, protect_text = parts[:6]
+            elif len(parts) >= 5:
                 repo, tag, pattern_text, archive_text, cleanup_text = parts[:5]
             elif len(parts) >= 4:
                 repo, tag, pattern_text, archive_text = parts[:4]
@@ -209,9 +215,10 @@ class Config:
             archive = archive_text.lower() not in ("0", "false", "no", "off")
             target_patterns = [item.strip() for item in pattern_text.split(",") if item.strip()] or ["*.apk"]
             cleanup_patterns = [item.strip() for item in cleanup_text.split(",") if item.strip()]
+            protected_patterns = [item.strip() for item in protect_text.split(",") if item.strip()]
             self.targets.append(ReleaseTarget(repo or self.repo, tag or None,
                                               target_patterns, archive, None,
-                                              cleanup_patterns))
+                                              cleanup_patterns, protected_patterns))
         self.raw_url = env("RAW_URL")
         self.raw_path = env("RAW_PATH")
         self.raw_base = env("RAW_BASE", "https://raw.githubusercontent.com").rstrip("/")
@@ -296,8 +303,12 @@ class Config:
                 if isinstance(cleanup, str):
                     cleanup = [part.strip() for part in cleanup.split(",")]
                 cleanup = [str(part).strip() for part in (cleanup or []) if str(part).strip()]
+                protect = item.get("protect")
+                if isinstance(protect, str):
+                    protect = [part.strip() for part in protect.split(",")]
+                protect = [str(part).strip() for part in (protect or []) if str(part).strip()]
                 targets.append(ReleaseTarget(repo, tag, pats, bool(item.get("archive", True)),
-                                             subdir, cleanup))
+                                             subdir, cleanup, protect))
             if targets:
                 self.targets = targets
         for target in self.targets:
@@ -319,7 +330,8 @@ class Config:
             "targets": [{"repo": target.repo, "tag": target.tag or "",
                          "patterns": list(target.patterns), "archive": target.archive,
                          "subdir": target.effective_subdir(),
-                         "cleanup": list(target.cleanup)} for target in self.targets],
+                         "cleanup": list(target.cleanup),
+                         "protect": list(target.protect)} for target in self.targets],
             "mode": self.mode,
         }
 
@@ -510,7 +522,7 @@ def plan_release(cfg, state, target):
                       "expected_size": asset.get("size"), "expected_digest": asset.get("digest"),
                       "fallback_url": fallback,
                       "archive": target.archive, "matched_total": len(matched),
-                      "subdir": subdir,
+                      "subdir": subdir, "protect": list(target.protect),
                       "meta": {"asset_id": asset.get("id"),
                                "asset_updated_at": asset.get("updated_at"),
                                "tag": tag, "repo": repo,
@@ -611,7 +623,7 @@ def plan_raw(cfg, state):
             "items": [{"asset_name": name, "state_key": key, "version": version,
                        "urls": candidates, "expected_size": length, "expected_digest": None,
                        "fallback_url": None, "archive": True, "matched_total": 1,
-                       "subdir": "",
+                       "subdir": "", "protect": [],
                        "meta": {"etag": etag, "last_modified": last_modified, "url": url}}],
             "description": "[raw] %s (%s bytes)" % (url, length)}
 
@@ -646,7 +658,7 @@ def item_dir(cfg, item):
     return os.path.join(cfg.download_dir, subdir) if subdir else cfg.download_dir
 
 
-def prune_old(cfg, work_dir, stem, ext):
+def prune_old(cfg, work_dir, stem, ext, protect=None):
     if cfg.keep_versions <= 0:
         return []
     pattern = os.path.join(work_dir, glob.escape(stem) + "-*" + glob.escape(ext))
@@ -654,6 +666,8 @@ def prune_old(cfg, work_dir, stem, ext):
     files.sort(key=os.path.getmtime, reverse=True)
     removed = []
     for path in files[cfg.keep_versions:]:
+        if is_protected(protect, os.path.basename(path)):
+            continue
         try:
             os.remove(path)
             removed.append(os.path.basename(path))
@@ -662,7 +676,7 @@ def prune_old(cfg, work_dir, stem, ext):
     return removed
 
 
-def remove_versioned_files(cfg, work_dir, name):
+def remove_versioned_files(cfg, work_dir, name, protect=None):
     stems = set()
     stem = sanitize_name(os.path.splitext(name)[0])
     if stem:
@@ -675,6 +689,8 @@ def remove_versioned_files(cfg, work_dir, name):
         pattern = os.path.join(work_dir, glob.escape(stem) + "-*" + glob.escape(ext))
         for path in glob.glob(pattern):
             if os.path.isfile(path) and os.path.basename(path) != name:
+                if is_protected(protect, os.path.basename(path)):
+                    continue
                 try:
                     os.remove(path)
                     removed.append(os.path.basename(path))
@@ -699,7 +715,7 @@ def cleanup_target_versioned(cfg, state, target):
         if not any(fnmatch.fnmatch(name.lower(), pattern.lower())
                    for pattern in target.patterns):
             continue
-        removed.extend(remove_versioned_files(cfg, work_dir, name))
+        removed.extend(remove_versioned_files(cfg, work_dir, name, target.protect))
         if entry.get("file") != name and os.path.isfile(os.path.join(work_dir, name)):
             entry["file"] = name
     return removed
@@ -710,6 +726,12 @@ def stale_group_keys(target, name):
         return [pattern for pattern in target.cleanup
                 if fnmatch.fnmatch(name.lower(), pattern.lower())]
     return [name_skeleton(name)]
+
+
+def is_protected(patterns, name):
+    name = str(name or "").lower()
+    return any(fnmatch.fnmatch(name, str(pattern).lower())
+               for pattern in patterns or [] if pattern)
 
 
 def cleanup_stale_names(cfg, state, target, repo, current_names):
@@ -734,6 +756,8 @@ def cleanup_stale_names(cfg, state, target, repo, current_names):
                    for pattern in target.patterns):
             continue
         if not (set(stale_group_keys(target, name)) & current_groups):
+            continue
+        if is_protected(target.protect, name) or is_protected(target.protect, entry.get("file")):
             continue
         for file_name in {entry.get("file"), name}:
             if not file_name or file_name in current:
@@ -814,6 +838,7 @@ def apply_download(cfg, state, plan):
         name = item["asset_name"]
         archive = item.get("archive", True)
         matched_total = item.get("matched_total") or 1
+        protect = item.get("protect") or []
         old_key, previous = previous_entry(assets_state, key, name)
         work_dir = item_dir(cfg, item)
         try:
@@ -841,7 +866,7 @@ def apply_download(cfg, state, plan):
             os.remove(part)
             log("%s: content identical (sha256 %s), nothing to do" % (name, sha[:12]))
             if not archive:
-                removed = remove_versioned_files(cfg, work_dir, name)
+                removed = remove_versioned_files(cfg, work_dir, name, protect)
                 if removed:
                     log("removed old versions: %s" % ", ".join(removed))
             merged = {field: previous[field] for field in
@@ -873,7 +898,7 @@ def apply_download(cfg, state, plan):
             else target_name, size, sha[:12]))
 
         if not archive:
-            removed = remove_versioned_files(cfg, work_dir, name)
+            removed = remove_versioned_files(cfg, work_dir, name, protect)
             if removed:
                 log("removed old versions: %s" % ", ".join(removed))
 
@@ -891,7 +916,7 @@ def apply_download(cfg, state, plan):
                 log("updated %s" % (os.path.join(item.get("subdir") or "", stable)
                                     if item.get("subdir") else stable))
 
-            removed = prune_old(cfg, work_dir, stem, ext)
+            removed = prune_old(cfg, work_dir, stem, ext, protect)
             if removed:
                 log("removed old versions: %s" % ", ".join(removed))
 
@@ -988,6 +1013,15 @@ def validate_config_update(cfg, data):
                 continue
             if "/" in text or "\\" in text:
                 return "旧版本清理模板不能包含 /（例如 runtime-mpv-*-arm64-v8a.apk）"
+        protect = item.get("protect")
+        if isinstance(protect, str):
+            protect = [part for part in protect.split(",") if part.strip()]
+        for entry in protect or []:
+            text = str(entry).strip()
+            if not text:
+                continue
+            if "/" in text or "\\" in text:
+                return "保护文件不能包含 /（例如 *-5.8.6.apk）"
     raw_days = data.get("check_interval_days")
     if raw_days is None:
         raw_days = data.get("check_interval_seconds")
@@ -1058,6 +1092,10 @@ def clean_config_payload(cfg, data):
         if isinstance(cleanup, str):
             cleanup = [part.strip() for part in cleanup.split(",")]
         cleanup = [str(part).strip() for part in (cleanup or []) if str(part).strip()]
+        protect = item.get("protect")
+        if isinstance(protect, str):
+            protect = [part.strip() for part in protect.split(",")]
+        protect = [str(part).strip() for part in (protect or []) if str(part).strip()]
         cleaned["targets"].append({
             "repo": str(item.get("repo") or "").strip().strip("/"),
             "tag": str(item.get("tag") or "").strip(),
@@ -1065,6 +1103,7 @@ def clean_config_payload(cfg, data):
             "archive": bool(item.get("archive", True)),
             "subdir": str(item.get("subdir") or "").strip(),
             "cleanup": cleanup,
+            "protect": protect,
         })
     return cleaned
 

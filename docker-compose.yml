@@ -42,6 +42,7 @@ services:
 
       GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
       PROXY_PREFIX: "${PROXY_PREFIX:-}"
+      PROTECT_PATTERNS: "${PROTECT_PATTERNS:-}"
       ALLOW_INSECURE: "${ALLOW_INSECURE:-0}"
       STATE_FILE: "/data/state.json"
     mem_limit: 256m
